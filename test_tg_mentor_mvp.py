@@ -455,6 +455,7 @@ class TestComputeRiskPlan:
         assert plan.shares == 25                           # 100 / 4
         assert plan.position_value == pytest.approx(2500.0)
         assert plan.max_loss == pytest.approx(100.0)
+        assert plan.expected_profit == pytest.approx(200.0)  # 25 * (108 - 100)
         assert plan.capped_by_capital is False
         assert plan.is_valid is True
 
@@ -464,6 +465,7 @@ class TestComputeRiskPlan:
         assert plan.take_profit == pytest.approx(112.0)
         assert plan.shares == 16  # 100 / 6 = 16.67 -> 16
         assert plan.max_loss == pytest.approx(96.0)
+        assert plan.expected_profit == pytest.approx(192.0)  # 16 * (112 - 100)
 
     def test_custom_capital_and_risk(self):
         plan = tg.compute_risk_plan(
@@ -478,6 +480,14 @@ class TestComputeRiskPlan:
         assert plan.shares == 100  # 10,000 / 100
         assert plan.capped_by_capital is True
         assert plan.position_value <= tg.VIRTUAL_CAPITAL
+
+    def test_expected_profit_is_twice_max_loss_at_1_to_2(self):
+        plan = tg.compute_risk_plan(snap(close=100.0, atr=3.0))
+        assert plan.expected_profit == pytest.approx(2 * plan.max_loss)
+
+    def test_expected_profit_zero_when_no_shares(self):
+        assert tg.compute_risk_plan(snap(close=1000.0, atr=60.0)).expected_profit == 0
+        assert tg.compute_risk_plan(snap(close=100.0, atr=0.0)).expected_profit == 0
 
     def test_risk_per_share_above_budget_gives_zero_shares(self):
         plan = tg.compute_risk_plan(snap(close=1000.0, atr=60.0))  # risk 120 > 100
@@ -589,6 +599,12 @@ class TestBuildRiskBlock:
 
     def test_explains_zero_shares(self):
         assert "אפילו מניה אחת" in tg.build_risk_block(snap(close=1000.0, atr=60.0))
+
+    def test_expected_profit_is_the_last_row(self):
+        text = tg.build_risk_block(snap(close=100.0, atr=2.0))
+        rows = [line for line in text.splitlines() if ":" in line and "$" in line]
+        assert "רווח מתוכנן אם היעד יושג:" in rows[-1]
+        assert rows[-1].endswith("$200.00")
 
     def test_handles_invalid_plan(self):
         text = tg.build_risk_block(snap(close=100.0, atr=0.0))

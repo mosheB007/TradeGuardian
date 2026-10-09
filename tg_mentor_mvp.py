@@ -525,6 +525,11 @@ class RiskPlan:
     def max_loss(self) -> float:
         return self.shares * self.risk_per_share
 
+    @property
+    def expected_profit(self) -> float:
+        """Profit if the take-profit target is reached."""
+        return self.shares * (self.take_profit - self.entry)
+
 
 def compute_risk_plan(
     snapshot: Snapshot,
@@ -704,6 +709,7 @@ def _risk_lines(plan: RiskPlan) -> list[str]:
             ("כמות מניות מקסימלית לקנייה:", f"{plan.shares:,}"),
             ("עלות הפוזיציה:", f"${plan.position_value:,.2f}"),
             ("הפסד מתוכנן אם הסטופ יופעל:", f"${plan.max_loss:,.2f}"),
+            ("רווח מתוכנן אם היעד יושג:", f"${plan.expected_profit:,.2f}"),
         ])
         if plan.capped_by_capital:
             lines.append(
