@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from streamlit.proto.Metric_pb2 import Metric as MetricProto
 from streamlit.testing.v1 import AppTest
 
 import tg_mentor_mvp as tg
@@ -120,6 +121,12 @@ class TestInitialScreen:
                       '[data-testid="stAppViewContainer"]'):
             assert frame not in [s.strip() for s in rtl_rule.split(",")], frame
 
+    def test_metric_delta_is_forced_ltr(self):
+        # Inside RTL, '-$0.43 (-0.28%)' is reordered to '(0.28%-) $0.43-'.
+        css = text_of(new_app().markdown)
+        delta_rule = css.split('[data-testid="stMetricDelta"]', 1)[1].split("}", 1)[0]
+        assert "direction: ltr" in delta_rule
+
     def test_css_forces_right_alignment_on_headings_and_markdown(self):
         # Streamlit sets text-align:left on headings/markdown containers, which
         # overrides an inherited RTL alignment unless forced.
@@ -145,6 +152,21 @@ class TestSidebar:
         assert capital.label == "הון וירטואלי בדולרים"
         assert capital.value == 10_000
         assert capital.step == 1000
+
+    def test_settings_survive_checking_a_new_ticker(self, monkeypatch):
+        patch_market(monkeypatch, history_result=make_ohlcv(UPTREND))
+        at = new_app()
+        at.number_input(key="capital").set_value(50_000)
+        at.number_input(key="risk_pct").set_value(2.5)
+        for ticker in ("NVDA", "AAPL"):
+            at.text_input(key="ticker").input(ticker)
+            at.button(key="check").click()
+            at.run()
+        assert not at.exception
+        assert at.number_input(key="capital").value == 50_000
+        assert at.number_input(key="risk_pct").value == pytest.approx(2.5)
+        assert at.session_state["capital"] == 50_000
+        assert at.session_state["risk_pct"] == pytest.approx(2.5)
 
     def test_risk_input_defaults(self):
         risk = new_app().number_input(key="risk_pct")
@@ -228,6 +250,39 @@ class TestLevels:
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
         assert calls == []  # no news for a disqualified stock
         assert RISK_TITLE not in page_text(at)
+
+    def close_metric(self, at):
+        return next(m for m in at.metric if m.label == "מחיר סגירה אחרון")
+
+    def test_close_metric_shows_green_daily_gain(self, monkeypatch):
+        df = make_ohlcv(UPTREND)
+        patch_market(monkeypatch, history_result=df)
+        snap = tg.latest_snapshot(tg.compute_indicators(df))
+        metric = self.close_metric(run_check())
+        assert metric.value == f"{snap.close:,.2f}"
+        assert metric.proto.delta == (
+            f"+${snap.daily_change:,.2f} (+{snap.daily_change_pct:.2f}%)"
+        )
+        assert metric.proto.direction == MetricProto.MetricDirection.UP
+        assert metric.proto.color == MetricProto.MetricColor.GREEN
+
+    def test_close_metric_shows_red_daily_loss(self, monkeypatch):
+        df = make_ohlcv(DOWNTREND)
+        patch_market(monkeypatch, history_result=df)
+        snap = tg.latest_snapshot(tg.compute_indicators(df))
+        assert snap.daily_change is not None and snap.daily_change < 0
+        metric = self.close_metric(run_check())
+        assert metric.proto.delta == (
+            f"-${abs(snap.daily_change):,.2f} ({snap.daily_change_pct:.2f}%)"
+        )
+        assert metric.proto.direction == MetricProto.MetricDirection.DOWN
+        assert metric.proto.color == MetricProto.MetricColor.RED
+
+    def test_close_metric_flat_day_is_gray(self, monkeypatch):
+        patch_market(monkeypatch, history_result=make_ohlcv(np.r_[UPTREND, UPTREND[-1]]))
+        metric = self.close_metric(run_check())
+        assert metric.proto.delta == "+$0.00 (+0.00%)"
+        assert metric.proto.color == MetricProto.MetricColor.GRAY
 
     def test_report_shows_indicator_metrics(self, monkeypatch):
         df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)

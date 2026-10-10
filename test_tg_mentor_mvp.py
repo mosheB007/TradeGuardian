@@ -375,6 +375,13 @@ class TestComputeIndicators:
 
 
 class TestLatestSnapshot:
+    def test_daily_change_vs_previous_close(self):
+        closes = np.linspace(100, 150, 120)
+        s = tg.latest_snapshot(tg.compute_indicators(make_ohlcv(closes)))
+        assert s.prev_close == pytest.approx(closes[-2])
+        assert s.daily_change == pytest.approx(closes[-1] - closes[-2])
+        assert s.daily_change_pct == pytest.approx((closes[-1] / closes[-2] - 1) * 100)
+
     def test_returns_last_row_values(self):
         closes = np.linspace(100, 150, 120)
         out = tg.compute_indicators(make_ohlcv(closes))
@@ -397,7 +404,8 @@ class TestLatestSnapshot:
 # ---------------------------------------------------------------------------
 
 def snap(
-    close=110.0, sma_50=100.0, rsi=40.0, volume=900.0, volume_sma_20=1000.0, atr=2.0
+    close=110.0, sma_50=100.0, rsi=40.0, volume=900.0, volume_sma_20=1000.0, atr=2.0,
+    prev_close=None,
 ):
     return tg.Snapshot(
         date=date(2026, 10, 8),
@@ -407,7 +415,32 @@ def snap(
         volume=volume,
         volume_sma_20=volume_sma_20,
         atr_14=atr,
+        prev_close=prev_close,
     )
+
+
+class TestDailyChange:
+    def test_gain(self):
+        s = snap(close=110.0, prev_close=100.0)
+        assert s.daily_change == pytest.approx(10.0)
+        assert s.daily_change_pct == pytest.approx(10.0)
+
+    def test_loss(self):
+        s = snap(close=95.0, prev_close=100.0)
+        assert s.daily_change == pytest.approx(-5.0)
+        assert s.daily_change_pct == pytest.approx(-5.0)
+
+    def test_unknown_previous_close(self):
+        s = snap(prev_close=None)
+        assert s.daily_change is None
+        assert s.daily_change_pct is None
+
+    def test_zero_previous_close_has_no_percent(self):
+        assert snap(close=1.0, prev_close=0.0).daily_change_pct is None
+
+    def test_daily_change_does_not_affect_classification(self):
+        base = snap(close=110.0, rsi=40.0)
+        assert tg.classify(base) == tg.classify(snap(close=110.0, rsi=40.0, prev_close=200.0))
 
 
 class TestClassify:

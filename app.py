@@ -90,6 +90,10 @@ input, code, pre {
 [data-testid="stMetricValue"] {
     direction: ltr;
 }
+/* Signed price deltas: in RTL '-$0.43 (-0.28%)' would read '(0.28%-) $0.43-'. */
+[data-testid="stMetricDelta"] {
+    direction: ltr;
+}
 </style>
 """
 
@@ -203,10 +207,31 @@ def render_earnings(a: Analysis) -> None:
     )
 
 
+def _daily_change_delta(s: Snapshot) -> tuple[str | None, bool]:
+    """Daily-change delta text for st.metric, e.g. '+$1.23 (+0.55%)'.
+
+    Returns (delta, is_flat). Streamlit colors a string delta red when it
+    starts with '-', else green; a flat day should be shown gray, arrowless.
+    """
+    change, pct = s.daily_change, s.daily_change_pct
+    if change is None or pct is None:
+        return None, False
+    flat = round(change, 2) == 0
+    sign = "-" if change < 0 and not flat else "+"
+    return f"{sign}${abs(change):,.2f} ({0.0 if flat else pct:+.2f}%)", flat
+
+
 def render_indicators(s: Snapshot) -> None:
     volume_pct = (s.volume / s.volume_sma_20 * 100) if s.volume_sma_20 else 0.0
     c1, c2, c3 = st.columns(3)
-    c1.metric("מחיר סגירה אחרון", f"{s.close:,.2f}")
+    daily_delta, flat_day = _daily_change_delta(s)
+    c1.metric(
+        "מחיר סגירה אחרון",
+        f"{s.close:,.2f}",
+        daily_delta,
+        delta_color="off" if flat_day else "normal",
+        delta_arrow="off" if flat_day else "auto",
+    )
     c2.metric(
         "ממוצע נע 50 יום (SMA 50)",
         f"{s.sma_50:,.2f}",

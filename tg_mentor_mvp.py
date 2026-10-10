@@ -167,6 +167,21 @@ class Snapshot:
     volume: float
     volume_sma_20: float
     atr_14: float
+    prev_close: float | None = None  # previous trading day's close (display only)
+
+    @property
+    def daily_change(self) -> float | None:
+        """Change vs the previous close, in price units; None if unknown."""
+        if self.prev_close is None:
+            return None
+        return self.close - self.prev_close
+
+    @property
+    def daily_change_pct(self) -> float | None:
+        """Change vs the previous close, in percent; None if unknown."""
+        if self.prev_close is None or self.prev_close == 0:
+            return None
+        return (self.close / self.prev_close - 1) * 100
 
     @property
     def rsi_is_low(self) -> bool:
@@ -347,6 +362,8 @@ def latest_snapshot(df: pd.DataFrame) -> Snapshot:
         volume=float(last["Volume"]),
         volume_sma_20=float(last["Volume_SMA_20"]),
         atr_14=float(last["ATR_14"]),
+        # The 6-month history already holds the previous session: no extra fetch.
+        prev_close=float(df["Close"].iloc[-2]) if len(df) >= 2 else None,
     )
 
 
