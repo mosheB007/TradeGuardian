@@ -46,7 +46,7 @@ class FakeTicker:
     """Stand-in for yfinance.Ticker: preset history/calendar, or raising.
 
     Defaults model yfinance's common "no data" answer: no earnings date
-    (calendar None).
+    (calendar None) and no valuation data (info None).
     """
 
     def __init__(
@@ -55,11 +55,15 @@ class FakeTicker:
         history_exc=None,
         calendar=None,
         calendar_exc=None,
+        info=None,
+        info_exc=None,
     ):
         self._result = history_result
         self._exc = history_exc
         self._calendar = calendar
         self._calendar_exc = calendar_exc
+        self._info = info
+        self._info_exc = info_exc
 
     def history(self, *args, **kwargs):
         if self._exc is not None:
@@ -71,6 +75,13 @@ class FakeTicker:
         if self._calendar_exc is not None:
             raise self._calendar_exc
         return self._calendar
+
+
+    @property
+    def info(self):
+        if self._info_exc is not None:
+            raise self._info_exc
+        return self._info
 
 
 def days_from_today(n):
@@ -742,6 +753,228 @@ class TestBuildEarningsBlock:
 
 
 # ---------------------------------------------------------------------------
+# Valuation context (Trailing P/E, Forward P/E, PEG) - educational only
+# ---------------------------------------------------------------------------
+
+VALUATION_TITLE = "בדיקת תמחור וערך (מכפילי רווח וצמיחה)"
+T = tg.ValuationTier
+
+
+class TestCleanFloat:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [(12.5, 12.5), (3, 3.0), (0, 0.0), (-4.2, -4.2), ("12.5", 12.5),
+         (np.float64(7.25), 7.25), (np.int64(4), 4.0)],
+    )
+    def test_accepts_finite_numbers(self, value, expected):
+        result = tg._clean_float(value)
+        assert result == expected
+        assert type(result) is float
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, True, False, float("nan"), float("inf"), float("-inf"), np.nan,
+         np.inf, "Infinity", "NaN", "abc", "", [], {}, object(), 10**400],
+    )
+    def test_rejects_everything_else(self, value):
+        assert tg._clean_float(value) is None
+
+
+class TestClassifyValuation:
+    @pytest.mark.parametrize(
+        "peg, expected",
+        [(0.01, T.ATTRACTIVE), (0.5, T.ATTRACTIVE), (0.999, T.ATTRACTIVE),
+         (1.0, T.FAIR), (1.5, T.FAIR), (2.0, T.FAIR),
+         (2.001, T.EXPENSIVE), (7.0, T.EXPENSIVE),
+         (0.0, T.UNPROFITABLE), (-0.8, T.UNPROFITABLE)],
+    )
+    def test_peg_decides_the_tier(self, peg, expected):
+        assert tg.classify_valuation(20.0, 18.0, peg, 5.0) is expected
+
+    @pytest.mark.parametrize("eps", [0.0, -0.01, -3.5])
+    def test_non_positive_eps_is_unprofitable_even_with_good_peg(self, eps):
+        assert tg.classify_valuation(20.0, 18.0, 0.5, eps) is T.UNPROFITABLE
+
+    @pytest.mark.parametrize("pe", [0.0, -12.0])
+    def test_non_positive_pe_without_peg_is_unprofitable(self, pe):
+        assert tg.classify_valuation(pe, None, None, None) is T.UNPROFITABLE
+
+    def test_peg_wins_over_trailing_pe_sign(self):
+        assert tg.classify_valuation(-5.0, 10.0, 1.5, None) is T.FAIR
+
+    @pytest.mark.parametrize(
+        "args",
+        [(None, None, None, None), (25.0, None, None, None),
+         (300.0, 40.0, None, 2.0), (None, 15.0, None, None)],
+    )
+    def test_no_peg_is_unknown(self, args):
+        assert tg.classify_valuation(*args) is T.UNKNOWN
+
+    def test_missing_eps_does_not_block_peg(self):
+        assert tg.classify_valuation(None, None, 0.7, None) is T.ATTRACTIVE
+
+
+class TestFetchValuation:
+    def fetch(self, monkeypatch, **kwargs):
+        patch_ticker(monkeypatch, **kwargs)
+        return tg.fetch_valuation("NVDA")
+
+    def test_extracts_all_fields(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={
+            "trailingPE": 30.0, "forwardPE": 20.0, "trailingPegRatio": 1.4,
+            "trailingEps": 4.0, "forwardEps": 6.0, "shortName": "ignored",
+        })
+        assert v == tg.Valuation(30.0, 20.0, 1.4, 4.0, 6.0, T.FAIR)
+
+    def test_prefers_trailing_peg_over_legacy_peg(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={"trailingPegRatio": 0.8, "pegRatio": 3.0})
+        assert v.peg_ratio == 0.8 and v.tier is T.ATTRACTIVE
+
+    @pytest.mark.parametrize("trailing_peg", [None, float("nan"), 0.0])
+    def test_falls_back_to_legacy_peg_key(self, monkeypatch, trailing_peg):
+        v = self.fetch(
+            monkeypatch, info={"trailingPegRatio": trailing_peg, "pegRatio": 3.0}
+        )
+        assert v.peg_ratio == 3.0 and v.tier is T.EXPENSIVE
+
+    def test_computes_peg_from_implied_eps_growth(self, monkeypatch):
+        # growth = (6 / 4 - 1) * 100 = 50%  ->  PEG = 20 / 50 = 0.4
+        v = self.fetch(monkeypatch, info={
+            "trailingPE": 30.0, "forwardPE": 20.0,
+            "trailingEps": 4.0, "forwardEps": 6.0,
+        })
+        assert v.peg_ratio == pytest.approx(0.4)
+        assert v.tier is T.ATTRACTIVE
+
+    def test_reported_peg_is_not_overridden_by_fallback(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={
+            "forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 6.0,
+            "pegRatio": 2.5,
+        })
+        assert v.peg_ratio == 2.5 and v.tier is T.EXPENSIVE
+
+    @pytest.mark.parametrize(
+        "info",
+        [
+            {"forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 4.0},   # flat
+            {"forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 3.0},   # shrinking
+            {"forwardPE": -20.0, "trailingEps": 4.0, "forwardEps": 6.0},  # bad P/E
+            {"forwardPE": 20.0, "trailingEps": 4.0},                      # no forecast
+            {"trailingEps": 4.0, "forwardEps": 6.0},                      # no fwd P/E
+        ],
+    )
+    def test_no_fallback_peg_without_positive_growth(self, monkeypatch, info):
+        v = self.fetch(monkeypatch, info=info)
+        assert v.peg_ratio is None and v.tier is T.UNKNOWN
+
+    def test_losing_company_is_unprofitable_and_gets_no_fallback_peg(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={
+            "forwardPE": 20.0, "trailingEps": -1.0, "forwardEps": 2.0,
+        })
+        assert v.peg_ratio is None and v.tier is T.UNPROFITABLE
+
+    def test_negative_trailing_pe_is_unprofitable(self, monkeypatch):
+        assert self.fetch(monkeypatch, info={"trailingPE": -8.0}).tier is T.UNPROFITABLE
+
+    def test_dirty_values_are_dropped(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={
+            "trailingPE": "Infinity", "forwardPE": float("nan"),
+            "trailingEps": None, "forwardEps": True, "pegRatio": "n/a",
+        })
+        assert v == tg.Valuation()
+
+    @pytest.mark.parametrize("info", [None, {}, [], "garbage", 42])
+    def test_missing_or_odd_info_degrades_to_unknown(self, monkeypatch, info):
+        assert self.fetch(monkeypatch, info=info) == tg.Valuation()
+
+    @pytest.mark.parametrize(
+        "exc", [ConnectionError("down"), RuntimeError("Yahoo flaked"), KeyError("x")]
+    )
+    def test_info_errors_never_raise(self, monkeypatch, exc):
+        assert self.fetch(monkeypatch, info_exc=exc) == tg.Valuation()
+
+    def test_ticker_constructor_error_never_raises(self, monkeypatch):
+        def boom(symbol):
+            raise RuntimeError("cannot build ticker")
+
+        monkeypatch.setattr(tg.yf, "Ticker", boom)
+        assert tg.fetch_valuation("NVDA") == tg.Valuation()
+
+    def test_default_valuation_is_unknown_and_frozen(self):
+        v = tg.Valuation()
+        assert v.tier is T.UNKNOWN
+        assert (v.trailing_pe, v.forward_pe, v.peg_ratio) == (None, None, None)
+        with pytest.raises(AttributeError):
+            v.tier = T.FAIR
+
+
+class TestBuildValuationBlock:
+    FULL = tg.Valuation(30.0, 20.0, 1.4, 4.0, 6.0, T.FAIR)
+
+    def test_title_and_three_numbers(self):
+        text = tg.build_valuation_block(self.FULL)
+        assert text.splitlines()[0] == VALUATION_TITLE
+        assert "מכפיל רווח נוכחי (Trailing P/E): 30.00" in text
+        assert "מכפיל רווח עתידי (Forward P/E): 20.00" in text
+        assert "יחס צמיחה (PEG Ratio): 1.40" in text
+        assert "לא זמין" not in text
+
+    def test_explanations_and_eps(self):
+        text = tg.build_valuation_block(self.FULL)
+        assert "ב-12 החודשים האחרונים (EPS = 4.00)." in text
+        assert "הצפוי בשנה הבאה (EPS = 6.00)." in text
+        assert "קצב הצמיחה של החברה" in text
+        assert "אינה משנה את הסיווג הטכני" in text
+
+    def test_missing_values_show_not_available(self):
+        text = tg.build_valuation_block(tg.Valuation())
+        assert "(Trailing P/E): לא זמין" in text
+        assert "(Forward P/E): לא זמין" in text
+        assert "(PEG Ratio): לא זמין" in text
+        assert "EPS =" not in text
+
+    GROWTH_NOTE = "הרווח צפוי לצמוח ולכן המכפיל העתידי נמוך יותר."
+
+    def test_notes_when_forward_pe_is_lower(self):
+        assert self.GROWTH_NOTE in tg.build_valuation_block(self.FULL)
+
+    @pytest.mark.parametrize(
+        "trailing, forward", [(20.0, 30.0), (20.0, 20.0), (None, 20.0), (20.0, None)]
+    )
+    def test_no_growth_note_otherwise(self, trailing, forward):
+        v = tg.Valuation(trailing_pe=trailing, forward_pe=forward)
+        assert self.GROWTH_NOTE not in tg.build_valuation_block(v)
+
+    @pytest.mark.parametrize(
+        "tier, verdict",
+        [
+            (T.ATTRACTIVE,
+             "[ירוק] תמחור נוח (זול יחסית לצמיחה) - PEG מתחת ל-1.0: "
+             "קצב הצמיחה של החברה מצדיק ואף עוקף את מכפיל הרווח שלה."),
+            (T.FAIR,
+             "[צהוב] תמחור בינוני (הוגן) - PEG בין 1.0 ל-2.0: "
+             "המניה נסחרת סביב השווי ההוגן שלה ביחס לקצב הצמיחה."),
+            (T.EXPENSIVE,
+             "[אדום] תמחור מנופח (פרמיה) - PEG מעל 2.0: "
+             "אתם משלמים פרמיה גבוהה על החברה ביחס לקצב הצמיחה שלה."),
+            (T.UNPROFITABLE,
+             "[אדום] חברה מפסידה או בצמיחה שלילית - אין מכפיל רווח חיובי תקין."),
+            (T.UNKNOWN,
+             "[צהוב] נתוני תמחור חסרים - לא ניתן לקבוע האם המחיר מנופח "
+             "(נפוץ בתעודות סל או כשאין תחזיות אנליסטים)."),
+        ],
+    )
+    def test_verdict_per_tier(self, tier, verdict):
+        text = tg.build_valuation_block(tg.Valuation(tier=tier))
+        assert verdict in text
+        others = [v for t, v in tg.VALUATION_VERDICTS.items() if t is not tier]
+        assert not any(other in text for other in others)
+
+    def test_every_tier_has_a_verdict(self):
+        assert set(tg.VALUATION_VERDICTS) == set(T)
+
+
+# ---------------------------------------------------------------------------
 # News (PRD 3.D - Human-in-the-Loop)
 # ---------------------------------------------------------------------------
 
@@ -989,6 +1222,46 @@ class TestMain:
             < output.index(DISCLAIMER)
         )
         assert self.prompts[1] == VETO_PROMPT
+
+    def test_valuation_block_follows_the_report(self, monkeypatch, capsys):
+        code, output = self.run_main(
+            monkeypatch, capsys, ["NVDA", "לא"],
+            history_result=make_ohlcv(UPTREND),
+            rss=rss_xml(rss_item("Big headline")),
+            info={"trailingPE": 30.0, "forwardPE": 20.0, "trailingPegRatio": 0.8},
+        )
+        assert code == 0
+        assert "[ירוק] תמחור נוח" in output
+        assert "[צהוב] דורשת זהירות" in output  # technical level is unchanged
+        assert (
+            output.index("tradingview.com")
+            < output.index(VALUATION_TITLE)
+            < output.index("Big headline")
+            < output.index(RISK_TITLE)
+        )
+
+    def test_valuation_failure_does_not_break_the_flow(self, monkeypatch, capsys):
+        code, output = self.run_main(
+            monkeypatch, capsys, ["NVDA", "לא"],
+            history_result=make_ohlcv(UPTREND),
+            info_exc=RuntimeError("Yahoo flaked"),
+        )
+        assert code == 0
+        assert "[צהוב] נתוני תמחור חסרים" in output
+        assert RISK_TITLE in output
+        assert "Traceback" not in output
+
+    def test_red_stock_still_shows_valuation_then_stops(self, monkeypatch, capsys):
+        code, output = self.run_main(
+            monkeypatch, capsys, ["NVDA"],
+            history_result=make_ohlcv(DOWNTREND),
+            info={"trailingPegRatio": 0.5},
+        )
+        assert code == 0
+        assert "[ירוק] תמחור נוח" in output  # cheap valuation...
+        assert "סיווג: [אדום]" in output      # ...does not rescue a RED stock
+        assert RISK_TITLE not in output
+        assert len(self.prompts) == 1
 
     def test_veto_yes_disqualifies_without_risk_block(self, monkeypatch, capsys):
         code, output = self.run_main(
