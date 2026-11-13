@@ -9,6 +9,10 @@ earnings blackout, RSS news and the capital shield - is imported unchanged
 from tg_mentor_mvp.py, so the CLI, the GUI and the test-suite share one
 implementation. This file only contains presentation and UI state.
 
+Live mode (GUI only): a current price incl. pre/after-market with a manual
+refresh button, and - while the session is open - indicators that include
+today's partial bar. The CLI keeps analysing the last completed session.
+
 Flow (as in the CLI, except that the GUI also lists headlines for RED stocks):
     1. Fetch prices. Earnings due today..+14 days -> red warning block,
        then the flow continues for learning purposes only.
@@ -35,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -44,6 +49,12 @@ from tg_mentor_mvp import (
     ENTRY_KNIFE_DISCOUNT_ATR,
     ENTRY_PULLBACK_ATR,
     EntryPlan,
+    LiveQuote,
+    SESSION_CLOSED,
+    SESSION_POST,
+    SESSION_PRE,
+    SESSION_REGULAR,
+    SESSION_UNKNOWN,
     REWARD_RISK_RATIO,
     RISK_PER_TRADE,
     RSI_THRESHOLD,
@@ -62,14 +73,15 @@ from tg_mentor_mvp import (
     compute_entry_plan,
     compute_indicators,
     compute_risk_plan,
-    drop_incomplete_session,
+    build_live_snapshot,
     fetch_news,
     fetch_next_earnings_date,
     fetch_price_history,
-    fetch_valuation,
+    fetch_live_quote,
+    fetch_ticker_info,
+    valuation_from_info,
     format_eps,
     is_earnings_too_close,
-    latest_snapshot,
     normalize_ticker,
     tradingview_url,
 )
@@ -149,6 +161,7 @@ class Analysis:
     news: tuple[NewsItem, ...] = ()
     valuation: Valuation = Valuation()  # educational; never affects `level`
     entry_plan: EntryPlan | None = None  # always set by run_analysis
+    live_quote: LiveQuote | None = None  # None when Yahoo gives no price
 
     @property
     def earnings_blocked(self) -> bool:
@@ -161,16 +174,19 @@ def run_analysis(raw_ticker: str) -> Analysis:
     """Run the CLI pipeline for one ticker. Raises TradeGuardianError."""
     ticker = normalize_ticker(raw_ticker)
     history = fetch_price_history(ticker)
-    history, session_open = drop_incomplete_session(history)
+    # Live mode: while the session is open the snapshot includes today's
+    # partial bar (volume fields still come from the last completed day).
+    snapshot, session_open = build_live_snapshot(history)
 
     today = date.today()
     earnings = fetch_next_earnings_date(ticker, today)
     # PRD 3.D: close earnings only add a red warning (see render_earnings);
     # the full analysis is always computed.
-    snapshot = latest_snapshot(compute_indicators(history))
     level = classify(snapshot)
     news = tuple(fetch_news(ticker))  # shown for every level, RED included
-    valuation = fetch_valuation(ticker)  # best-effort, never raises
+    info = fetch_ticker_info(ticker)  # one request feeds valuation + quote
+    valuation = valuation_from_info(info)  # best-effort, never raises
+    live_quote = fetch_live_quote(ticker, info)  # best-effort, may be None
     entry_plan = compute_entry_plan(
         snapshot,
         # Unknown earnings date -> unknown condition, not a pass.
@@ -179,7 +195,7 @@ def run_analysis(raw_ticker: str) -> Analysis:
     )
     return Analysis(
         ticker, today, session_open, earnings, snapshot, level, news, valuation,
-        entry_plan,
+        entry_plan, live_quote,
     )
 
 
@@ -612,6 +628,7 @@ def render_entry_plan(a: Analysis, capital: float, risk_pct: float) -> float:
     )
     m2.metric("סטופ-לוס (Stop-Loss)", f"{risk.stop_loss:,.2f}")
     m3.metric(f"יעד רווח (1:{REWARD_RISK_RATIO:g})", f"{risk.take_profit:,.2f}")
+    render_live_vs_plan(a.live_quote, entry, risk.stop_loss)
     with st.expander("איך מזינים את זה באפליקציית הברוקר?"):
         st.markdown(
             f"1. **כניסה:** בוחרים \"קניה בלימיט\" (Limit) ומזינים {entry:,.2f}. "
@@ -624,11 +641,88 @@ def render_entry_plan(a: Analysis, capital: float, risk_pct: float) -> float:
     return entry
 
 
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+REFRESH = "refresh"
+LIVE_DELAY_NOTE = "מקור: Yahoo Finance - ייתכן עיכוב של עד כרבע שעה."
+_SESSION_LABEL = {
+    SESSION_REGULAR: "מסחר רגיל",
+    SESSION_PRE: "מסחר מוקדם (Pre-Market)",
+    SESSION_POST: "מסחר מאוחר (After-Hours)",
+    SESSION_CLOSED: "השוק סגור - סגירה אחרונה",
+    SESSION_UNKNOWN: "מחיר אחרון",
+}
+
+
+def _request_refresh() -> None:
+    st.session_state.refresh_requested = True
+
+
+def _signed_change(change: float, pct: float) -> str:
+    """'+$1.23 (+0.55%)' / '-$1.23 (-0.55%)' for st.metric deltas."""
+    sign = "-" if change < 0 else "+"
+    return f"{sign}${abs(change):,.2f} ({pct:+.2f}%)"
+
+
+def render_live_quote(a: Analysis) -> None:
+    """Current price (incl. pre/after-market) with a manual refresh button."""
+    live = a.live_quote
+    if live is None:
+        st.warning(
+            "לא ניתן לקבל מחיר נוכחי כרגע. הניתוח שלהלן מבוסס על נתוני המסחר היומיים.",
+            icon="⚠️",
+        )
+    else:
+        delta = None
+        if live.change is not None and live.change_pct is not None:
+            delta = _signed_change(live.change, live.change_pct)
+        st.metric(f"מחיר נוכחי: {a.ticker}", f"{live.price:,.2f}", delta)
+        parts = [_SESSION_LABEL.get(live.session, _SESSION_LABEL[SESSION_UNKNOWN])]
+        if live.time is not None:
+            stamp = live.time.astimezone(ISRAEL_TZ)
+            parts.append(f"עודכן {stamp:%d/%m %H:%M} (שעון ישראל)")
+        if delta is not None:
+            parts.append("השינוי מול הסגירה הרשמית האחרונה")
+        st.caption(" · ".join(parts) + ". " + LIVE_DELAY_NOTE)
+        if live.session in (SESSION_PRE, SESSION_POST):
+            st.caption(
+                "מחוץ לשעות המסחר הרגילות המסחר דליל ותנודתי: המחיר עשוי להשתנות "
+                "משמעותית עד הפתיחה, והוא אינו נכלל באינדיקטורים."
+            )
+    st.button("רענן מחיר", key=REFRESH, on_click=_request_refresh)
+
+
+def render_live_vs_plan(live: LiveQuote | None, entry: float, stop_loss: float) -> None:
+    """Where the current price sits relative to the planned limit and stop."""
+    if live is None:
+        return
+    price = f"{live.price:,.2f}"
+    if live.price <= stop_loss:
+        st.error(
+            f"**המחיר הנוכחי ({price}) כבר מתחת לסטופ-לוס ({stop_loss:,.2f}).**\n\n"
+            "התוכנית הזו אינה תקפה כרגע: הוראת Limit הייתה מתבצעת, והסטופ היה "
+            "מופעל מיד. המתן להתייצבות ותכנן מחדש.",
+            icon="🛑",
+        )
+    elif live.price <= entry:
+        st.info(
+            f"המחיר הנוכחי ({price}) כבר ברמת ה-Limit ({entry:,.2f}) או מתחתיה - "
+            "הוראת Limit במחיר הזה הייתה מתבצעת מיד.",
+            icon="ℹ️",
+        )
+    else:
+        gap = (live.price / entry - 1) * 100
+        st.caption(
+            f"המחיר הנוכחי {price} - {gap:.1f}% מעל מחיר ה-Limit. "
+            "ההוראה תתבצע רק אם המחיר יירד אליו."
+        )
+
+
 def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
+    render_live_quote(a)
     if a.session_open:
         st.info(
-            "המסחר היום עדיין פתוח והנתונים של היום חלקיים, "
-            "ולכן הניתוח מבוסס על יום המסחר המלא האחרון.",
+            "המסחר פתוח: האינדיקטורים כוללים את הנר החלקי של היום ועשויים להשתנות "
+            "עד הסגירה. מחזור המסחר נלקח מיום המסחר המלא האחרון.",
             icon="⏳",
         )
     render_earnings(a)  # a red earnings warning does not stop the flow
@@ -703,6 +797,9 @@ def main() -> None:
     capital, risk_pct = render_sidebar()
 
     st.text_input("סימול מניה", key="ticker", placeholder="למשל NVDA")
+    refresh = st.session_state.pop("refresh_requested", False)
+    previous = st.session_state.get("analysis")
+    refresh_failed = False
     if st.button("בדוק מניה", key="check", type="primary", width="stretch"):
         st.session_state.decision = None
         st.session_state.analysis = None
@@ -716,9 +813,19 @@ def main() -> None:
             st.session_state.error = (
                 "אירעה שגיאה לא צפויה בעיבוד הנתונים. נסה שוב או בדוק טיקר אחר."
             )
+    elif refresh and previous is not None:
+        # Same ticker, fresh data. The decision and the planned entry price
+        # are kept; on failure the previous analysis stays on screen.
+        try:
+            with st.spinner("מרענן מחיר..."):
+                st.session_state.analysis = run_analysis(previous.ticker)
+        except Exception:  # noqa: BLE001 - a failed refresh must not lose the page
+            refresh_failed = True
 
     error = st.session_state.get("error")
     analysis = st.session_state.get("analysis")
+    if refresh_failed:
+        st.warning("הרענון נכשל כרגע - מוצגים הנתונים הקודמים. נסה שוב בעוד רגע.", icon="⚠️")
     if error:
         st.error(error, icon="❌")
     elif analysis is not None:

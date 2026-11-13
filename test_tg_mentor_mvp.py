@@ -46,7 +46,7 @@ class FakeTicker:
     """Stand-in for yfinance.Ticker: preset history/calendar, or raising.
 
     Defaults model yfinance's common "no data" answer: no earnings date
-    (calendar None) and no valuation data (info None).
+    (calendar None), no valuation data (info None) and no 1-minute bars.
     """
 
     def __init__(
@@ -57,6 +57,8 @@ class FakeTicker:
         calendar_exc=None,
         info=None,
         info_exc=None,
+        minute_result=None,
+        minute_exc=None,
     ):
         self._result = history_result
         self._exc = history_exc
@@ -64,8 +66,14 @@ class FakeTicker:
         self._calendar_exc = calendar_exc
         self._info = info
         self._info_exc = info_exc
+        self._minute_result = minute_result
+        self._minute_exc = minute_exc
 
     def history(self, *args, **kwargs):
+        if kwargs.get("interval") == "1m":  # live-quote fallback, not the analysis
+            if self._minute_exc is not None:
+                raise self._minute_exc
+            return self._minute_result
         if self._exc is not None:
             raise self._exc
         return self._result
@@ -1260,6 +1268,264 @@ class TestComputeEntryPlan:
         plan = tg.compute_entry_plan(s)
         assert plan.falling_knife
         assert plan.limit_price == pytest.approx(round(s.close - 2 * s.atr_14, 2))
+
+
+# ---------------------------------------------------------------------------
+# Live price layer (current quote incl. extended hours, live snapshot)
+# ---------------------------------------------------------------------------
+
+Q_TIME = 1794560000  # an arbitrary epoch second
+
+
+def minute_bars(closes, end="2026-11-13 08:30", tz="America/New_York"):
+    index = pd.date_range(end=end, periods=len(closes), freq="min", tz=tz)
+    return pd.DataFrame({"Close": closes}, index=index)
+
+
+class TestLiveQuoteModel:
+    def test_change_vs_reference_close(self):
+        q = tg.LiveQuote(95.0, tg.SESSION_PRE, None, 100.0)
+        assert q.change == pytest.approx(-5.0)
+        assert q.change_pct == pytest.approx(-5.0)
+
+    @pytest.mark.parametrize("reference", [None, 0.0])
+    def test_no_reference_means_no_change(self, reference):
+        q = tg.LiveQuote(95.0, tg.SESSION_CLOSED, None, reference)
+        assert q.change_pct is None
+        if reference is None:
+            assert q.change is None
+
+    def test_is_frozen(self):
+        with pytest.raises(AttributeError):
+            tg.LiveQuote(1.0, tg.SESSION_REGULAR).price = 2.0
+
+
+class TestFetchTickerInfo:
+    def test_returns_the_info_dict(self, monkeypatch):
+        patch_ticker(monkeypatch, info={"trailingPE": 12.0})
+        assert tg.fetch_ticker_info("NVDA") == {"trailingPE": 12.0}
+
+    @pytest.mark.parametrize("info", [None, [], "garbage", 42])
+    def test_non_dict_becomes_empty(self, monkeypatch, info):
+        patch_ticker(monkeypatch, info=info)
+        assert tg.fetch_ticker_info("NVDA") == {}
+
+    def test_errors_become_empty(self, monkeypatch):
+        patch_ticker(monkeypatch, info_exc=RuntimeError("Yahoo flaked"))
+        assert tg.fetch_ticker_info("NVDA") == {}
+
+
+class TestValuationFromInfo:
+    INFO = {"trailingPE": 30.0, "forwardPE": 20.0, "trailingPegRatio": 1.4,
+            "trailingEps": 4.0, "forwardEps": 6.0}
+
+    def test_matches_fetch_valuation(self, monkeypatch):
+        patch_ticker(monkeypatch, info=self.INFO)
+        assert tg.valuation_from_info(self.INFO) == tg.fetch_valuation("NVDA")
+        assert tg.valuation_from_info(self.INFO).tier is T.FAIR
+
+    @pytest.mark.parametrize("info", [None, {}, [], "garbage"])
+    def test_missing_info_is_unknown(self, info):
+        assert tg.valuation_from_info(info) == tg.Valuation()
+
+
+class TestFetchLiveQuote:
+    def quote(self, monkeypatch, info=None, **kwargs):
+        patch_ticker(monkeypatch, info=info, **kwargs)
+        return tg.fetch_live_quote("NVDA")
+
+    def test_regular_session_compares_with_previous_close(self, monkeypatch):
+        q = self.quote(monkeypatch, {
+            "marketState": "REGULAR", "regularMarketPrice": 166.19,
+            "regularMarketPreviousClose": 173.73, "regularMarketTime": Q_TIME,
+            "preMarketPrice": 170.0, "postMarketPrice": 160.0,  # stale, ignored
+        })
+        assert q.price == 166.19 and q.session == tg.SESSION_REGULAR
+        assert q.reference_close == 173.73
+        assert q.time == datetime.fromtimestamp(Q_TIME, tz=tg.timezone.utc)
+        assert q.change_pct == pytest.approx((166.19 / 173.73 - 1) * 100)
+
+    def test_regular_session_falls_back_to_previous_close_key(self, monkeypatch):
+        q = self.quote(monkeypatch, {
+            "marketState": "REGULAR", "currentPrice": 50.0, "previousClose": 48.0,
+        })
+        assert q.price == 50.0 and q.reference_close == 48.0 and q.time is None
+
+    def test_pre_market_compares_with_last_official_close(self, monkeypatch):
+        q = self.quote(monkeypatch, {
+            "marketState": "PRE", "preMarketPrice": 160.5, "preMarketTime": Q_TIME,
+            "regularMarketPrice": 166.19, "regularMarketPreviousClose": 173.73,
+        })
+        assert q.price == 160.5 and q.session == tg.SESSION_PRE
+        assert q.reference_close == 166.19  # yesterday's close, not the day before
+        assert q.time is not None
+
+    @pytest.mark.parametrize("state", ["POST", "POSTPOST", "PREPRE", "CLOSED"])
+    def test_after_hours_price_is_used_when_the_market_is_shut(self, monkeypatch, state):
+        q = self.quote(monkeypatch, {
+            "marketState": state, "postMarketPrice": 164.0, "postMarketTime": Q_TIME,
+            "regularMarketPrice": 166.19, "preMarketPrice": 150.0,
+        })
+        assert q.price == 164.0 and q.session == tg.SESSION_POST
+        assert q.reference_close == 166.19
+
+    def test_pre_market_without_a_pre_price_shows_the_last_close(self, monkeypatch):
+        q = self.quote(monkeypatch, {"marketState": "PRE", "regularMarketPrice": 166.19})
+        assert q.price == 166.19 and q.session == tg.SESSION_CLOSED
+        assert q.reference_close is None and q.change is None
+
+    def test_closed_without_extended_price_is_the_last_close(self, monkeypatch):
+        q = self.quote(monkeypatch, {
+            "marketState": "CLOSED", "regularMarketPrice": 166.19,
+            "regularMarketTime": Q_TIME,
+        })
+        assert q.session == tg.SESSION_CLOSED and q.reference_close is None
+
+    def test_missing_market_state_is_unknown(self, monkeypatch):
+        q = self.quote(monkeypatch, {"regularMarketPrice": 166.19})
+        assert q.price == 166.19 and q.session == tg.SESSION_UNKNOWN
+
+    def test_market_state_is_case_insensitive(self, monkeypatch):
+        q = self.quote(monkeypatch, {"marketState": "regular", "regularMarketPrice": 9.0})
+        assert q.session == tg.SESSION_REGULAR
+
+    @pytest.mark.parametrize("bad", [None, 0, -5.0, float("nan"), "Infinity", True, "x"])
+    def test_dirty_prices_are_rejected(self, monkeypatch, bad):
+        q = self.quote(monkeypatch, {"marketState": "REGULAR", "regularMarketPrice": bad})
+        assert q is None
+
+    @pytest.mark.parametrize("bad_time", [None, "soon", -1, float("inf"), 1e30])
+    def test_dirty_timestamps_become_none(self, monkeypatch, bad_time):
+        q = self.quote(monkeypatch, {
+            "marketState": "REGULAR", "regularMarketPrice": 9.0,
+            "regularMarketTime": bad_time,
+        })
+        assert q.price == 9.0 and q.time is None
+
+    def test_falls_back_to_the_last_minute_bar(self, monkeypatch):
+        q = self.quote(monkeypatch, info={}, minute_result=minute_bars([160.0, 161.25]))
+        assert q.price == 161.25 and q.session == tg.SESSION_UNKNOWN
+        assert q.reference_close is None
+        assert q.time == pd.Timestamp("2026-11-13 08:30", tz="America/New_York")
+
+    def test_minute_fallback_skips_trailing_nan(self, monkeypatch):
+        bars = minute_bars([160.0, float("nan")])
+        assert self.quote(monkeypatch, info=None, minute_result=bars).price == 160.0
+
+    def test_minute_fallback_requests_extended_hours(self, monkeypatch):
+        captured = {}
+
+        class SpyTicker(FakeTicker):
+            def history(self, *args, **kwargs):
+                captured.update(kwargs)
+                return minute_bars([10.0])
+
+        monkeypatch.setattr(tg.yf, "Ticker", lambda symbol: SpyTicker())
+        assert tg.fetch_live_quote("NVDA").price == 10.0
+        assert captured == {"period": "1d", "interval": "1m", "prepost": True}
+
+    def test_info_quote_does_not_request_minute_bars(self, monkeypatch):
+        patch_ticker(
+            monkeypatch, info={"marketState": "REGULAR", "regularMarketPrice": 9.0},
+            minute_exc=AssertionError("minute bars must not be requested"),
+        )
+        assert tg.fetch_live_quote("NVDA").price == 9.0
+
+    @pytest.mark.parametrize(
+        "bars", [None, pd.DataFrame(), pd.DataFrame({"Open": [1.0]}),
+                 pd.DataFrame({"Close": [float("nan")]}), pd.DataFrame({"Close": [0.0]})],
+    )
+    def test_no_quote_when_both_sources_are_empty(self, monkeypatch, bars):
+        assert self.quote(monkeypatch, info={}, minute_result=bars) is None
+
+    def test_never_raises(self, monkeypatch):
+        q = self.quote(
+            monkeypatch, info_exc=RuntimeError("down"), minute_exc=OSError("down")
+        )
+        assert q is None
+
+    def test_daily_history_is_never_mistaken_for_a_quote(self, monkeypatch):
+        # The daily frame belongs to the analysis; only 1-minute bars are a quote.
+        q = self.quote(monkeypatch, info={}, history_result=make_ohlcv([100.0] * 60))
+        assert q is None
+
+    def test_passed_info_is_used_without_a_request(self, monkeypatch):
+        def boom(symbol):
+            raise AssertionError("no request expected")
+
+        monkeypatch.setattr(tg.yf, "Ticker", boom)
+        q = tg.fetch_live_quote(
+            "NVDA", {"marketState": "REGULAR", "regularMarketPrice": 7.0}
+        )
+        assert q.price == 7.0
+
+
+class TestBuildLiveSnapshot:
+    OPEN = pd.Timestamp("2026-10-08 11:00")     # make_ohlcv's last bar is 2026-10-08
+    CLOSED = pd.Timestamp("2026-10-08 18:00")
+
+    def frame(self):
+        closes = np.r_[np.linspace(100, 150, 119), 140.0]
+        volumes = np.r_[np.full(118, 1_000_000.0), 2_000_000.0, 50_000.0]
+        return make_ohlcv(closes, volumes)
+
+    def test_closed_session_equals_the_plain_snapshot(self):
+        df = self.frame()
+        snapshot, session_open = tg.build_live_snapshot(df, now=self.CLOSED)
+        assert session_open is False
+        assert snapshot == tg.latest_snapshot(tg.compute_indicators(df))
+        assert snapshot.partial_session is False
+
+    def test_open_session_keeps_todays_bar_for_price_indicators(self):
+        df = self.frame()
+        live = tg.latest_snapshot(tg.compute_indicators(df))
+        snapshot, session_open = tg.build_live_snapshot(df, now=self.OPEN)
+        assert session_open is True and snapshot.partial_session is True
+        assert snapshot.date == date(2026, 10, 8)
+        assert snapshot.close == pytest.approx(140.0)
+        for field in ("sma_50", "rsi_14", "atr_14", "prev_close", "low_20",
+                      "close_slide_ago"):
+            assert getattr(snapshot, field) == pytest.approx(getattr(live, field))
+
+    def test_open_session_takes_volume_from_the_last_completed_day(self):
+        df = self.frame()
+        settled = tg.latest_snapshot(tg.compute_indicators(df.iloc[:-1]))
+        snapshot, _ = tg.build_live_snapshot(df, now=self.OPEN)
+        assert snapshot.volume == pytest.approx(2_000_000.0)       # yesterday
+        assert snapshot.volume_sma_20 == pytest.approx(settled.volume_sma_20)
+        assert snapshot.volume != pytest.approx(50_000.0)          # not the partial bar
+
+    def test_partial_low_volume_cannot_fake_a_green_level(self):
+        # Above SMA_50 with a low RSI; only today's partial volume is "calm".
+        closes = np.concatenate([np.linspace(100, 160, 105), np.linspace(160, 154, 15)])
+        volumes = np.r_[np.full(118, 1_000_000.0), 3_000_000.0, 10_000.0]
+        df = make_ohlcv(closes, volumes)
+        plain = tg.latest_snapshot(tg.compute_indicators(df))
+        assert tg.classify(plain) is tg.Level.GREEN          # the trap
+        snapshot, _ = tg.build_live_snapshot(df, now=self.OPEN)
+        assert tg.classify(snapshot) is tg.Level.YELLOW      # yesterday's heavy volume
+
+    def test_too_little_history_still_raises_the_hebrew_error(self):
+        with pytest.raises(tg.DataFetchError):
+            tg.build_live_snapshot(make_ohlcv([100.0] * 30), now=self.OPEN)
+
+
+class TestPanicDayOnAPartialSession:
+    def partial(self, **kwargs):
+        return tg.Snapshot(**{**entry_snap(**kwargs).__dict__, "partial_session": True})
+
+    def test_sharp_drop_alone_flags_a_knife_while_the_session_is_open(self):
+        s = self.partial(prev_close=113.0, volume=100.0)  # drop 3.0 = 1.5 x ATR
+        plan = tg.compute_entry_plan(s)
+        assert plan.conditions[1].ok is False and plan.falling_knife
+
+    def test_same_drop_on_a_completed_calm_day_is_not_a_knife(self):
+        plan = tg.compute_entry_plan(entry_snap(prev_close=113.0, volume=100.0))
+        assert plan.conditions[1].ok is True and not plan.falling_knife
+
+    def test_small_drop_on_a_partial_session_is_not_a_knife(self):
+        plan = tg.compute_entry_plan(self.partial(prev_close=112.9, volume=9000.0))
+        assert not plan.falling_knife
 
 
 # ---------------------------------------------------------------------------

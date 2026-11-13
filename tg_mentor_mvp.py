@@ -57,8 +57,8 @@ import re
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from datetime import date, datetime, time
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from urllib.parse import urlencode
@@ -187,6 +187,9 @@ class Snapshot:
     # Entry planning (optional so older callers keep working):
     low_20: float | None = None           # lowest low of the previous 20 sessions
     close_slide_ago: float | None = None  # close KNIFE_SLIDE_DAYS sessions ago
+    # True when `close` comes from today's still-open session (GUI live mode);
+    # the volume fields then describe the last completed session.
+    partial_session: bool = False
 
     @property
     def daily_change(self) -> float | None:
@@ -625,7 +628,14 @@ def classify_valuation(
 def fetch_valuation(ticker: str) -> Valuation:
     """Best-effort valuation multiples from Yahoo. Never raises."""
     try:
-        info = yf.Ticker(ticker).info
+        return valuation_from_info(yf.Ticker(ticker).info)
+    except Exception:  # noqa: BLE001 - unstable endpoint must never crash the CLI
+        return Valuation()
+
+
+def valuation_from_info(info: object) -> Valuation:
+    """Build a Valuation from an already-fetched `.info` dict. Never raises."""
+    try:
         if not isinstance(info, dict):
             return Valuation()
         trailing_pe = _clean_float(info.get("trailingPE"))
@@ -658,6 +668,152 @@ def fetch_valuation(ticker: str) -> Valuation:
         )
     except Exception:  # noqa: BLE001 - unstable endpoint must never crash the CLI
         return Valuation()
+
+
+# ---------------------------------------------------------------------------
+# Live price layer (GUI) - best-effort, never raises
+#
+# Yahoo is an unofficial source: the price may lag by up to ~15 minutes and
+# the endpoint may be missing fields or rate-limited. Everything here
+# degrades to "no quote" rather than failing the analysis.
+# ---------------------------------------------------------------------------
+
+SESSION_PRE, SESSION_REGULAR, SESSION_POST = "pre", "regular", "post"
+SESSION_CLOSED, SESSION_UNKNOWN = "closed", "unknown"
+
+
+@dataclass(frozen=True)
+class LiveQuote:
+    """The most recent price Yahoo reports, including extended hours."""
+
+    price: float
+    session: str                           # one of the SESSION_* constants
+    time: datetime | None = None           # timezone-aware (UTC); None if unknown
+    reference_close: float | None = None   # last official close to compare with
+
+    @property
+    def change(self) -> float | None:
+        if self.reference_close is None:
+            return None
+        return self.price - self.reference_close
+
+    @property
+    def change_pct(self) -> float | None:
+        if not self.reference_close:
+            return None
+        return (self.price / self.reference_close - 1) * 100
+
+
+def fetch_ticker_info(ticker: str) -> dict:
+    """Yahoo's `.info` dict, or {} on any failure. Never raises."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info if isinstance(info, dict) else {}
+    except Exception:  # noqa: BLE001 - unstable endpoint must never crash the app
+        return {}
+
+
+def _positive(value: object) -> float | None:
+    number = _clean_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _epoch_to_datetime(value: object) -> datetime | None:
+    """Yahoo timestamps are epoch seconds; anything else -> None."""
+    seconds = _positive(value)
+    if seconds is None:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _quote_from_info(info: dict) -> LiveQuote | None:
+    state = str(info.get("marketState") or "").upper()
+    regular = _positive(info.get("regularMarketPrice")) or _positive(
+        info.get("currentPrice")
+    )
+    pre = _positive(info.get("preMarketPrice"))
+    post = _positive(info.get("postMarketPrice"))
+    regular_time = _epoch_to_datetime(info.get("regularMarketTime"))
+
+    if state.startswith("PRE") and state != "PREPRE" and pre is not None:
+        # Pre-market: compare with yesterday's official close.
+        return LiveQuote(
+            pre, SESSION_PRE, _epoch_to_datetime(info.get("preMarketTime")), regular
+        )
+    if state in ("POST", "POSTPOST", "PREPRE", "CLOSED") and post is not None:
+        # After-hours (or overnight): the last extended-hours trade.
+        return LiveQuote(
+            post, SESSION_POST, _epoch_to_datetime(info.get("postMarketTime")), regular
+        )
+    if regular is None:
+        return None
+    if state == "REGULAR":
+        previous = _positive(info.get("regularMarketPreviousClose")) or _positive(
+            info.get("previousClose")
+        )
+        return LiveQuote(regular, SESSION_REGULAR, regular_time, previous)
+    # Closed (or an unknown state) with no extended-hours price: the last
+    # official close is all there is, so there is nothing to compare it with.
+    session = SESSION_UNKNOWN if not state else SESSION_CLOSED
+    return LiveQuote(regular, session, regular_time, None)
+
+
+def _quote_from_minute_bars(ticker: str) -> LiveQuote | None:
+    """Fallback: the last 1-minute bar, extended hours included."""
+    bars = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
+    if not isinstance(bars, pd.DataFrame) or bars.empty or "Close" not in bars.columns:
+        return None
+    closes = bars["Close"].dropna()
+    if closes.empty:
+        return None
+    price = _positive(closes.iloc[-1])
+    if price is None:
+        return None
+    stamp = pd.Timestamp(closes.index[-1])
+    when = stamp.tz_convert("UTC").to_pydatetime() if stamp.tzinfo else None
+    return LiveQuote(price, SESSION_UNKNOWN, when, None)
+
+
+def fetch_live_quote(ticker: str, info: dict | None = None) -> LiveQuote | None:
+    """Latest price from Yahoo, or None if unavailable. Never raises.
+
+    Pass `info` (from fetch_ticker_info) to avoid a second request.
+    """
+    try:
+        if info is None:
+            info = fetch_ticker_info(ticker)
+        quote = _quote_from_info(info) if isinstance(info, dict) else None
+        return quote if quote is not None else _quote_from_minute_bars(ticker)
+    except Exception:  # noqa: BLE001 - a missing quote must never stop the analysis
+        return None
+
+
+def build_live_snapshot(
+    history: pd.DataFrame, now: pd.Timestamp | None = None
+) -> tuple[Snapshot, bool]:
+    """Snapshot that includes today's partial bar while the session is open.
+
+    Returns (snapshot, session_open). While the market trades, SMA_50, RSI_14
+    and ATR_14 are computed on the partial bar, but the volume fields come
+    from the last *completed* session: a partial day's volume is always low
+    and would fake the "calm volume" condition. Outside trading hours this
+    is exactly latest_snapshot() on the full history.
+    """
+    settled, session_open = drop_incomplete_session(history, now)
+    if not session_open:
+        return latest_snapshot(compute_indicators(history)), False
+    live = latest_snapshot(compute_indicators(history))
+    base = latest_snapshot(compute_indicators(settled))
+    snapshot = replace(
+        live,
+        volume=base.volume,
+        volume_sma_20=base.volume_sma_20,
+        partial_session=True,
+    )
+    return snapshot, True
 
 
 # ---------------------------------------------------------------------------
@@ -767,11 +923,12 @@ def _is_panic_day(s: Snapshot) -> bool | None:
     """Sharp one-day drop on unusually heavy volume; None if unknown."""
     if s.prev_close is None or s.atr_14 <= 0:
         return None
-    drop = s.prev_close - s.close
-    return (
-        drop >= KNIFE_DAY_DROP_ATR * s.atr_14
-        and s.volume >= KNIFE_DAY_VOLUME_RATIO * s.volume_sma_20
-    )
+    sharp_drop = s.prev_close - s.close >= KNIFE_DAY_DROP_ATR * s.atr_14
+    if s.partial_session:
+        # Today's volume is not final yet, so the drop alone raises the flag
+        # (deliberately conservative while the session is still open).
+        return sharp_drop
+    return sharp_drop and s.volume >= KNIFE_DAY_VOLUME_RATIO * s.volume_sma_20
 
 
 def _is_sharp_slide(s: Snapshot) -> bool | None:
