@@ -25,6 +25,11 @@ GREEN_VOLUMES = np.r_[np.full(119, 1_000_000.0), 500_000.0]
 
 RISK_TITLE = "מגן הון (ניהול סיכונים לעסקה מדומה)"
 DISCLAIMER = "אינה מספקת איתותי מסחר"
+EARNINGS_CONTINUES = "הניתוח ממשיך לצורכי לימוד בלבד - שים לב לסיכון הגבוה לפני דוח כספי."
+EARNINGS_REMINDER = (
+    "תזכורת קריטית: קיים דוח כספי ב-14 הימים הקרובים. "
+    "קו ההגנה (Stop-Loss) אינו מגן מפני פער מחירים (Gap) לאחר פרסום הדוח."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,19 +311,85 @@ class TestLevels:
 # ---------------------------------------------------------------------------
 
 class TestEarnings:
-    def test_earnings_within_14_days_blocks_everything(self, monkeypatch):
+    def patch_close_earnings(self, monkeypatch, closes=UPTREND, days=5):
+        self.df = make_ohlcv(closes)
         patch_market(
             monkeypatch,
-            history_result=make_ohlcv(UPTREND),
-            calendar={"Earnings Date": [days_from_today(5)]},
+            history_result=self.df,
+            calendar={"Earnings Date": [days_from_today(days)]},
         )
-        calls = patch_news(monkeypatch, rss_xml(rss_item("Hidden")))
+
+    def test_earnings_within_14_days_warns_red_and_flow_continues(self, monkeypatch):
+        self.patch_close_earnings(monkeypatch)
+        calls = patch_news(monkeypatch, rss_xml(rss_item("Still shown")))
         at = run_check()
-        assert "דוח כספי" in text_of(at.error)
-        assert "בעוד 5 ימים" in text_of(at.error)
-        assert "דוח לימודי טכני" not in page_text(at)
+        errors = text_of(at.error)
+        assert "נפסלת - דוח כספי קרוב: NVDA" in errors
+        assert "בעוד 5 ימים" in errors
+        assert EARNINGS_CONTINUES in errors
+        assert "הניתוח נעצר" not in page_text(at)
+        assert "מחוץ לחלון הסיכון" not in page_text(at)
+        # The full flow continues behind the red warning.
+        text = page_text(at)
+        assert "דוח לימודי טכני: NVDA" in text
+        assert "דורשת זהירות" in text_of(at.warning)  # level box (YELLOW)
+        assert "Still shown" in text
+        assert len(calls) == 1
+        assert {"approve", "veto"} <= button_keys(at)
+        assert RISK_TITLE not in text  # only after approval
+        assert EARNINGS_REMINDER not in text
+
+    def test_earnings_today_warns_red_and_flow_continues(self, monkeypatch):
+        self.patch_close_earnings(monkeypatch, days=0)
+        at = run_check()
+        assert "היום" in text_of(at.error)
+        assert "דוח לימודי טכני: NVDA" in page_text(at)
+        assert {"approve", "veto"} <= button_keys(at)
+
+    def test_approve_with_close_earnings_shows_risk_plan_and_reminder(
+        self, monkeypatch
+    ):
+        self.patch_close_earnings(monkeypatch)
+        plan = tg.compute_risk_plan(tg.latest_snapshot(tg.compute_indicators(self.df)))
+        at = run_check()
+        at.button(key="approve").click()
+        at.run()
+        assert not at.exception
+        text = page_text(at)
+        assert RISK_TITLE in text
+        assert f"{plan.stop_loss:,.2f}" in text
+        assert f"{plan.shares:,}" in [str(m.value) for m in at.metric]
+        errors = [str(e.value) for e in at.error]
+        assert EARNINGS_REMINDER in errors
+        assert any(EARNINGS_CONTINUES in e for e in errors)  # top warning persists
+
+    def test_veto_with_close_earnings_disqualifies_without_reminder(self, monkeypatch):
+        self.patch_close_earnings(monkeypatch)
+        at = run_check()
+        at.button(key="veto").click()
+        at.run()
+        assert not at.exception
+        assert "נפסלה לפי החלטתך" in text_of(at.error)
+        assert RISK_TITLE not in page_text(at)
+        assert EARNINGS_REMINDER not in page_text(at)
+
+    def test_close_earnings_red_stock_shows_report_but_no_news(self, monkeypatch):
+        self.patch_close_earnings(monkeypatch, closes=DOWNTREND)
+        calls = patch_news(monkeypatch, rss_xml(rss_item("Irrelevant")))
+        at = run_check()
+        assert EARNINGS_CONTINUES in text_of(at.error)
+        assert "דוח לימודי טכני: NVDA" in page_text(at)
+        assert "על הגדר" in text_of(at.error)
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
         assert calls == []
+
+    def test_no_reminder_in_risk_plan_when_earnings_are_far(self, monkeypatch):
+        self.patch_close_earnings(monkeypatch, days=40)
+        at = run_check()
+        at.button(key="approve").click()
+        at.run()
+        assert RISK_TITLE in page_text(at)
+        assert EARNINGS_REMINDER not in page_text(at)
 
     def test_unknown_earnings_shows_yellow_warning(self, monkeypatch):
         patch_market(monkeypatch, history_result=make_ohlcv(UPTREND), calendar=None)

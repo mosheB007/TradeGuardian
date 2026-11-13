@@ -10,11 +10,14 @@ from tg_mentor_mvp.py, so the CLI, the GUI and the test-suite share one
 implementation. This file only contains presentation and UI state.
 
 Flow (same as the CLI):
-    1. Fetch prices. Earnings due today..+14 days -> red block, stop.
+    1. Fetch prices. Earnings due today..+14 days -> red warning block,
+       then the flow continues for learning purposes only.
        (Earnings date unknown -> yellow warning, continue.)
     2. Technical report + level box (success / warning / error). RED -> stop.
     3. GREEN/YELLOW: headlines + "approve" / "disqualify" buttons.
-       Approve -> capital shield.  Disqualify -> red veto message.
+       Approve -> capital shield (plus a red earnings reminder when a
+       report is due within the blackout window).
+       Disqualify -> red veto message.
 
 Run:
     streamlit run app.py
@@ -104,6 +107,11 @@ DISCLAIMER = (
 
 APPROVE, VETO = "approve", "veto"
 
+EARNINGS_RISK_REMINDER = (
+    f"תזכורת קריטית: קיים דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים. "
+    "קו ההגנה (Stop-Loss) אינו מגן מפני פער מחירים (Gap) לאחר פרסום הדוח."
+)
+
 
 # ---------------------------------------------------------------------------
 # Analysis (mirrors tg_mentor_mvp.main(), without printing)
@@ -117,8 +125,8 @@ class Analysis:
     today: date
     session_open: bool
     earnings: date | None
-    snapshot: Snapshot | None = None  # None when stopped by the earnings blackout
-    level: Level | None = None
+    snapshot: Snapshot
+    level: Level
     news: tuple[NewsItem, ...] = ()
 
     @property
@@ -136,10 +144,8 @@ def run_analysis(raw_ticker: str) -> Analysis:
 
     today = date.today()
     earnings = fetch_next_earnings_date(ticker, today)
-    result = Analysis(ticker, today, session_open, earnings)
-    if result.earnings_blocked:
-        return result  # PRD 3.D: stop before any technical analysis
-
+    # PRD 3.D: close earnings only add a red warning (see render_earnings);
+    # the full analysis is always computed.
     snapshot = latest_snapshot(compute_indicators(history))
     level = classify(snapshot)
     news = tuple(fetch_news(ticker)) if level is not Level.RED else ()
@@ -196,7 +202,7 @@ def render_earnings(a: Analysis) -> None:
             "קרוב מדי ומסוכן לסחור.\n\n"
             "סביב פרסום דוח כספי המחיר עלול לזנק או לצנוח בפער (Gap) חד בבת אחת, "
             "וקו ההגנה (Stop-Loss) לא יוכל להגן עליך.\n\n"
-            "הניתוח נעצר כאן. בדוק את המניה שוב לאחר פרסום הדוח.",
+            "הניתוח ממשיך לצורכי לימוד בלבד - שים לב לסיכון הגבוה לפני דוח כספי.",
             icon="🛑",
         )
         return
@@ -373,9 +379,11 @@ def render_veto_result(ticker: str) -> None:
     )
 
 
-def render_risk(plan: RiskPlan) -> None:
+def render_risk(plan: RiskPlan, earnings_blocked: bool = False) -> None:
     pct = _pct(plan.risk_pct)
     st.subheader("מגן הון (ניהול סיכונים לעסקה מדומה)")
+    if earnings_blocked:
+        st.error(EARNINGS_RISK_REMINDER, icon="🛑")
     if not plan.is_valid:
         st.markdown(
             f"- **הון וירטואלי:** {_money(plan.capital)}\n"
@@ -427,9 +435,7 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
             "ולכן הניתוח מבוסס על יום המסחר המלא האחרון.",
             icon="⏳",
         )
-    render_earnings(a)
-    if a.snapshot is None or a.level is None:
-        return  # stopped by the earnings blackout
+    render_earnings(a)  # a red earnings warning does not stop the flow
 
     st.subheader(f"דוח לימודי טכני: {a.ticker}")
     st.caption(f"יום המסחר האחרון בנתונים: {a.snapshot.date.isoformat()}")
@@ -445,7 +451,10 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     if decision == APPROVE:
         st.divider()
         # Recomputed on every rerun, so sidebar changes apply immediately.
-        render_risk(compute_risk_plan(a.snapshot, capital=capital, risk_pct=risk_pct))
+        render_risk(
+            compute_risk_plan(a.snapshot, capital=capital, risk_pct=risk_pct),
+            earnings_blocked=a.earnings_blocked,
+        )
     elif decision == VETO:
         render_veto_result(a.ticker)
     else:

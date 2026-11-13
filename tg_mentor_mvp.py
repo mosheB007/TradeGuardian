@@ -14,7 +14,8 @@ Implements PRD sections 3.A (data), 3.B (indicators), 3.C (3-level filter),
 the chart-link requirement from section 4.
 
 Flow:
-    1. Fetch prices. If earnings are due today..+14 days -> RED, stop.
+    1. Fetch prices. If earnings are due today..+14 days -> red warning
+       block, then the flow continues for learning purposes only.
        (Earnings date unknown -> yellow warning, continue.)
     2. Technical report + 3-level classification. RED -> stop.
     3. GREEN/YELLOW: show headlines, ask the user for a news veto.
@@ -794,7 +795,7 @@ def _days_until_text(days: int) -> str:
 
 
 def build_earnings_block(ticker: str, earnings: date, today: date) -> str:
-    """Render the red 'earnings too close' disqualification."""
+    """Render the red 'earnings too close' warning (the flow continues after it)."""
     when = _days_until_text((earnings - today).days)
     return "\n".join([
         SEPARATOR,
@@ -804,7 +805,7 @@ def build_earnings_block(ticker: str, earnings: date, today: date) -> str:
         f"  זה בתוך חלון של {EARNINGS_BLACKOUT_DAYS} הימים הקרובים - קרוב מדי ומסוכן לסחור.",
         "  סביב פרסום דוח כספי המחיר עלול לזנק או לצנוח בפער (Gap) חד בבת אחת,",
         "  וקו ההגנה (Stop-Loss) לא יוכל להגן עליך.",
-        "  הניתוח נעצר כאן. בדוק את המניה שוב לאחר פרסום הדוח.",
+        "  הניתוח ממשיך לצורכי לימוד בלבד. מומלץ להמתין לפרסום הדוח לפני כניסה לעסקה.",
     ])
 
 
@@ -880,14 +881,14 @@ def main() -> int:
         history = fetch_price_history(ticker)
         history, session_open = drop_incomplete_session(history)
 
-        # PRD 3.D: an imminent earnings report disqualifies before any analysis.
+        # PRD 3.D: an imminent earnings report gets a red warning block, but
+        # the analysis continues behind it for learning purposes.
         today = date.today()
         earnings = fetch_next_earnings_date(ticker, today)
-        if earnings is not None and is_earnings_too_close(earnings, today):
+        earnings_blocked = earnings is not None and is_earnings_too_close(earnings, today)
+        if earnings_blocked:
             print()
             print(build_earnings_block(ticker, earnings, today))
-            print(build_footer())
-            return 0
 
         snapshot = latest_snapshot(compute_indicators(history))
         level = classify(snapshot)
@@ -899,7 +900,7 @@ def main() -> int:
             )
         if earnings is None:
             print(f"[צהוב] {EARNINGS_UNKNOWN_MESSAGE}")
-        else:
+        elif not earnings_blocked:  # the red block above already covers it
             print(build_earnings_info_line(earnings, today))
         print()
         print(build_report(ticker, snapshot, level))

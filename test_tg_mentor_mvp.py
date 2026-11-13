@@ -268,7 +268,9 @@ class TestFetchPriceHistory:
     def test_enables_yfinance_exceptions_so_network_errors_surface(self, monkeypatch):
         # By default yfinance swallows network errors and returns an empty
         # frame, which would be misreported as "ticker not found".
-        monkeypatch.setattr(tg.yf.config.debug, "hide_exceptions", True)
+        # setitem on the backing dict: yfinance's NestedConfig has no real
+        # attributes, so monkeypatch.setattr cannot undo itself at teardown.
+        monkeypatch.setitem(tg.yf.config.debug.data, "hide_exceptions", True)
         patch_ticker(monkeypatch, history_result=make_ohlcv([100.0] * 60))
         tg.fetch_price_history("NVDA")
         assert tg.yf.config.debug.hide_exceptions is False
@@ -726,6 +728,14 @@ class TestBuildEarningsBlock:
         assert "בעוד 5 ימים" in text
         assert "דוח כספי" in text
 
+    def test_says_analysis_continues_for_learning_only(self):
+        text = tg.build_earnings_block("NVDA", date(2026, 10, 14), date(2026, 10, 9))
+        assert text.splitlines()[-1] == (
+            "  הניתוח ממשיך לצורכי לימוד בלבד. "
+            "מומלץ להמתין לפרסום הדוח לפני כניסה לעסקה."
+        )
+        assert "נעצר" not in text
+
     def test_today_wording(self):
         text = tg.build_earnings_block("NVDA", date(2026, 10, 9), date(2026, 10, 9))
         assert "היום" in text
@@ -945,6 +955,8 @@ class TestAskNewsVeto:
 
 UPTREND = np.linspace(100, 200, 120)    # above SMA_50 -> YELLOW (RSI high)
 DOWNTREND = np.linspace(200, 100, 120)  # below SMA_50 -> RED
+EARNINGS_BLOCK_TITLE = "[אדום] נפסלת - דוח כספי קרוב: NVDA"
+EARNINGS_CONTINUES = "הניתוח ממשיך לצורכי לימוד בלבד"
 EARNINGS_UNKNOWN = "לא אותר תאריך דוח כספי. באחריותך לבדוק זאת ידנית לפני כניסה לעסקה."
 
 
@@ -987,29 +999,70 @@ class TestMain:
         assert RISK_TITLE not in output
         assert DISCLAIMER in output
 
-    def test_earnings_within_14_days_stops_immediately(self, monkeypatch, capsys):
+    def test_earnings_within_14_days_warns_red_and_flow_continues(
+        self, monkeypatch, capsys
+    ):
         code, output = self.run_main(
-            monkeypatch, capsys, ["NVDA"],
+            monkeypatch, capsys, ["NVDA", "לא"],
             history_result=make_ohlcv(UPTREND),
             calendar={"Earnings Date": [days_from_today(5)]},
-            rss=rss_xml(rss_item("Should not be shown")),
+            rss=rss_xml(rss_item("Still shown")),
         )
         assert code == 0
-        assert "[אדום]" in output and "דוח כספי" in output
-        assert "דוח לימודי טכני" not in output  # analysis stopped
-        assert "Should not be shown" not in output
-        assert self.rss_calls == []  # news never fetched
-        assert RISK_TITLE not in output
-        assert len(self.prompts) == 1  # never asked the veto question
+        assert EARNINGS_BLOCK_TITLE in output
+        assert "בעוד 5 ימים" in output
+        assert EARNINGS_CONTINUES in output
+        assert "הניתוח נעצר" not in output
+        assert "מחוץ לחלון הסיכון" not in output  # no contradicting info line
+        assert len(self.rss_calls) == 1  # news fetched as usual
+        assert self.prompts[1] == VETO_PROMPT
+        # Order: red warning -> report -> news -> risk block -> one disclaimer.
+        assert (
+            output.index(EARNINGS_BLOCK_TITLE)
+            < output.index("דוח לימודי טכני")
+            < output.index("Still shown")
+            < output.index(RISK_TITLE)
+            < output.index(DISCLAIMER)
+        )
+        assert output.count(DISCLAIMER) == 1
 
-    def test_earnings_today_stops_immediately(self, monkeypatch, capsys):
+    def test_earnings_today_warns_red_and_flow_continues(self, monkeypatch, capsys):
         code, output = self.run_main(
-            monkeypatch, capsys, ["NVDA"],
+            monkeypatch, capsys, ["NVDA", "לא"],
             history_result=make_ohlcv(UPTREND),
             calendar={"Earnings Date": [date.today()]},
         )
         assert code == 0
-        assert "דוח לימודי טכני" not in output
+        assert EARNINGS_BLOCK_TITLE in output and "היום" in output
+        assert "דוח לימודי טכני" in output
+        assert RISK_TITLE in output
+
+    def test_close_earnings_veto_still_disqualifies(self, monkeypatch, capsys):
+        code, output = self.run_main(
+            monkeypatch, capsys, ["NVDA", "כן"],
+            history_result=make_ohlcv(UPTREND),
+            calendar={"Earnings Date": [days_from_today(5)]},
+        )
+        assert code == 0
+        assert EARNINGS_BLOCK_TITLE in output
+        assert "נפסלה לפי החלטתך" in output
+        assert RISK_TITLE not in output
+
+    def test_close_earnings_red_stock_still_stops_after_report(
+        self, monkeypatch, capsys
+    ):
+        code, output = self.run_main(
+            monkeypatch, capsys, ["NVDA"],
+            history_result=make_ohlcv(DOWNTREND),
+            calendar={"Earnings Date": [days_from_today(5)]},
+            rss=rss_xml(rss_item("Irrelevant")),
+        )
+        assert code == 0
+        assert EARNINGS_BLOCK_TITLE in output
+        assert "דוח לימודי טכני" in output
+        assert self.rss_calls == []  # technical RED still skips news
+        assert RISK_TITLE not in output
+        assert len(self.prompts) == 1
 
     def test_far_earnings_date_is_shown_and_flow_continues(self, monkeypatch, capsys):
         far = days_from_today(40)
