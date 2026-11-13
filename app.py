@@ -13,7 +13,9 @@ Flow (same as the CLI):
     1. Fetch prices. Earnings due today..+14 days -> red warning block,
        then the flow continues for learning purposes only.
        (Earnings date unknown -> yellow warning, continue.)
-    2. Technical report + level box (success / warning / error). RED -> stop.
+    2. Technical report + level box (success / warning / error), then an
+       educational valuation section (P/E, Forward P/E, PEG) that never
+       affects the level. RED -> stop.
     3. GREEN/YELLOW: headlines + "approve" / "disqualify" buttons.
        Approve -> capital shield (plus a red earnings reminder when a
        report is due within the blackout window).
@@ -46,6 +48,8 @@ from tg_mentor_mvp import (
     Snapshot,
     VIRTUAL_CAPITAL,
     TradeGuardianError,
+    Valuation,
+    ValuationTier,
     classify,
     compute_indicators,
     compute_risk_plan,
@@ -53,6 +57,7 @@ from tg_mentor_mvp import (
     fetch_news,
     fetch_next_earnings_date,
     fetch_price_history,
+    fetch_valuation,
     is_earnings_too_close,
     latest_snapshot,
     normalize_ticker,
@@ -128,6 +133,7 @@ class Analysis:
     snapshot: Snapshot
     level: Level
     news: tuple[NewsItem, ...] = ()
+    valuation: Valuation = Valuation()  # educational; never affects `level`
 
     @property
     def earnings_blocked(self) -> bool:
@@ -149,7 +155,10 @@ def run_analysis(raw_ticker: str) -> Analysis:
     snapshot = latest_snapshot(compute_indicators(history))
     level = classify(snapshot)
     news = tuple(fetch_news(ticker)) if level is not Level.RED else ()
-    return Analysis(ticker, today, session_open, earnings, snapshot, level, news)
+    valuation = fetch_valuation(ticker)  # best-effort, never raises
+    return Analysis(
+        ticker, today, session_open, earnings, snapshot, level, news, valuation
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +339,83 @@ def render_chart_link(ticker: str) -> None:
         )
 
 
+VALUATION_NOT_AVAILABLE = "לא זמין"
+
+
+def render_valuation(v: Valuation) -> None:
+    """Educational valuation context; never affects the technical level."""
+    st.subheader("בדיקת תמחור וערך (האם המניה יקרה?)")
+    st.caption("בדיקת התמחור היא הקשר לימודי בלבד ואינה משנה את הסיווג הטכני")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "1. מכפיל רווח (P/E)",
+        f"{v.trailing_pe:.1f}" if v.trailing_pe is not None else VALUATION_NOT_AVAILABLE,
+        f"רווח למניה: ${v.trailing_eps:.2f}" if v.trailing_eps is not None else None,
+        delta_color="off",
+        delta_arrow="off",
+    )
+    c2.metric(
+        "2. מכפיל עתידי (Forward P/E)",
+        f"{v.forward_pe:.1f}" if v.forward_pe is not None else VALUATION_NOT_AVAILABLE,
+        f"רווח צפוי: ${v.forward_eps:.2f}" if v.forward_eps is not None else None,
+        delta_color="off",
+        delta_arrow="off",
+    )
+    c3.metric(
+        "3. יחס צמיחה (PEG)",
+        f"{v.peg_ratio:.2f}" if v.peg_ratio is not None else VALUATION_NOT_AVAILABLE,
+    )
+
+    if v.tier is ValuationTier.ATTRACTIVE:
+        st.success(
+            "**תמחור: מחיר טוב / אטרקטיבי (PEG מתחת ל-1)**\n\n"
+            "קצב הצמיחה של החברה מהיר יותר ממכפיל הרווח שלה. למרות שמכפיל הרווח "
+            "הרגיל עשוי להיראות גבוה, הצמיחה העתידית מצדיקה את המחיר.",
+            icon="🟢",
+        )
+    elif v.tier is ValuationTier.FAIR:
+        st.warning(
+            "**תמחור: בינוני / הוגן (PEG בין 1 ל-2)**\n\n"
+            "מכפיל הרווח תואם באופן סביר את קצב הצמיחה הצפוי של החברה. "
+            "המחיר אינו זול במיוחד אך גם לא מנופח.",
+            icon="🟡",
+        )
+    elif v.tier is ValuationTier.EXPENSIVE:
+        st.error(
+            "**תמחור: מנופח / פרמיה (PEG מעל 2)**\n\n"
+            "מעל 2 אתם משלמים פרמיה אמיתית על החברה! המחיר הנוכחי גבוה מאוד "
+            "ביחס לקצב הצמיחה הצפוי שלה.",
+            icon="🔴",
+        )
+    elif v.tier is ValuationTier.UNPROFITABLE:
+        st.error(
+            "**תמחור: חברה מפסידה או בצמיחה שלילית**\n\n"
+            "לחברה אין כרגע רווח נקי חיובי או שצמיחת הרווחים שלילית, "
+            "ולכן מכפיל הרווח אינו תקף.",
+            icon="🔴",
+        )
+    else:  # ValuationTier.UNKNOWN
+        st.info(
+            "**תמחור: נתונים חסרים**\n\n"
+            "לא נמצאו מספיק נתוני רווח או תחזיות צמיחה ב-Yahoo Finance "
+            "(נפוץ בתעודות סל או בחברות ללא כיסוי אנליסטים).",
+            icon="ℹ️",
+        )
+
+    with st.expander("איך לקרוא את 3 המספרים האלה? (הסבר לימודי)"):
+        st.markdown(
+            "- **1. מכפיל רווח (P/E):** מחיר המניה חלקי הרווח של החברה ב-12 "
+            "החודשים האחרונים. מראה כמה דולרים משלמים על כל דולר רווח שהחברה "
+            "ייצרה בעבר.\n"
+            "- **2. מכפיל רווח עתידי (Forward P/E):** מחיר המניה חלקי הרווח הצפוי "
+            "בשנה הבאה. אם המכפיל העתידי נמוך מהמכפיל הנוכחי, סימן שהאנליסטים "
+            "צופים שהרווחים יגדלו.\n"
+            "- **3. יחס PEG (המספר הקובע):** מתאים את מכפיל הרווח לקצב הצמיחה של "
+            "החברה. מניה עם מכפיל רווח גבוה יכולה להיות למעשה זולה אם היא צומחת "
+            "מהר מאוד (PEG מתחת ל-1), בעוד שמניה עם PEG מעל 2 נסחרת בפרמיה מנופחת."
+        )
+
+
 def render_news(ticker: str, items: tuple[NewsItem, ...]) -> None:
     # The English term sits on its own line: mixed inside a Hebrew heading
     # its parentheses get reordered by the bidi algorithm.
@@ -442,6 +528,8 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     render_indicators(a.snapshot)
     render_level(a.snapshot, a.level)
     render_chart_link(a.ticker)
+    st.divider()
+    render_valuation(a.valuation)  # shown for every level, RED included
     if a.level is Level.RED:
         return
 

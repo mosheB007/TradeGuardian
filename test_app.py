@@ -408,6 +408,167 @@ class TestEarnings:
 
 
 # ---------------------------------------------------------------------------
+# Valuation context (educational; independent of the technical level)
+# ---------------------------------------------------------------------------
+
+VALUATION_TITLE = "בדיקת תמחור וערך (האם המניה יקרה?)"
+VALUATION_CAPTION = "בדיקת התמחור היא הקשר לימודי בלבד ואינה משנה את הסיווג הטכני"
+VALUATION_EXPANDER = "איך לקרוא את 3 המספרים האלה? (הסבר לימודי)"
+PE_LABEL = "1. מכפיל רווח (P/E)"
+FORWARD_PE_LABEL = "2. מכפיל עתידי (Forward P/E)"
+PEG_LABEL = "3. יחס צמיחה (PEG)"
+FULL_INFO = {
+    "trailingPE": 30.04, "forwardPE": 20.06, "trailingPegRatio": 1.456,
+    "trailingEps": 4.129, "forwardEps": 6.5,
+}
+
+
+class TestValuation:
+    def check(self, monkeypatch, info=None, closes=GREEN_CLOSES, volumes=GREEN_VOLUMES,
+              **kwargs):
+        if closes is not GREEN_CLOSES:
+            volumes = None
+        patch_market(
+            monkeypatch, history_result=make_ohlcv(closes, volumes), info=info, **kwargs
+        )
+        return run_check()
+
+    def metric(self, at, label):
+        return next(m for m in at.metric if m.label == label)
+
+    def test_section_title_caption_and_expander(self, monkeypatch):
+        at = self.check(monkeypatch, FULL_INFO)
+        assert VALUATION_TITLE in text_of(at.subheader)
+        assert VALUATION_CAPTION in text_of(at.caption)
+        assert VALUATION_EXPANDER in [e.label for e in at.expander]
+        guide = text_of(at.markdown)
+        assert "**1. מכפיל רווח (P/E):**" in guide
+        assert "**2. מכפיל רווח עתידי (Forward P/E):**" in guide
+        assert "**3. יחס PEG (המספר הקובע):**" in guide
+
+    def test_metrics_are_formatted(self, monkeypatch):
+        at = self.check(monkeypatch, FULL_INFO)
+        pe = self.metric(at, PE_LABEL)
+        assert pe.value == "30.0"
+        assert pe.proto.delta == "רווח למניה: $4.13"
+        forward = self.metric(at, FORWARD_PE_LABEL)
+        assert forward.value == "20.1"
+        assert forward.proto.delta == "רווח צפוי: $6.50"
+        peg = self.metric(at, PEG_LABEL)
+        assert peg.value == "1.46"
+        assert peg.proto.delta == ""
+
+    def test_eps_deltas_are_gray_and_arrowless(self, monkeypatch):
+        at = self.check(monkeypatch, FULL_INFO)
+        for label in (PE_LABEL, FORWARD_PE_LABEL):
+            proto = self.metric(at, label).proto
+            assert proto.color == MetricProto.MetricColor.GRAY
+            assert proto.direction == MetricProto.MetricDirection.NONE
+
+    def test_missing_values_show_not_available_without_delta(self, monkeypatch):
+        at = self.check(monkeypatch, info=None)
+        for label in (PE_LABEL, FORWARD_PE_LABEL, PEG_LABEL):
+            metric = self.metric(at, label)
+            assert metric.value == "לא זמין"
+            assert metric.proto.delta == ""
+
+    def test_partial_values_are_formatted_independently(self, monkeypatch):
+        at = self.check(monkeypatch, {"trailingPE": 12.0, "forwardEps": 2.0})
+        assert self.metric(at, PE_LABEL).value == "12.0"
+        assert self.metric(at, PE_LABEL).proto.delta == ""        # no trailing EPS
+        assert self.metric(at, FORWARD_PE_LABEL).value == "לא זמין"
+        assert self.metric(at, FORWARD_PE_LABEL).proto.delta == "רווח צפוי: $2.00"
+        assert self.metric(at, PEG_LABEL).value == "לא זמין"
+
+    def test_zero_peg_is_displayed_not_treated_as_missing(self, monkeypatch):
+        at = self.check(monkeypatch, {"trailingPegRatio": 0.0})
+        assert self.metric(at, PEG_LABEL).value == "0.00"
+        assert "חברה מפסידה או בצמיחה שלילית" in text_of(at.error)
+
+    # GREEN technical level -> its own st.success box; valuation boxes are
+    # told apart by their bold "תמחור:" heading.
+    @pytest.mark.parametrize(
+        "info, box, heading, body",
+        [
+            ({"trailingPegRatio": 0.6}, "success",
+             "**תמחור: מחיר טוב / אטרקטיבי (PEG מתחת ל-1)**",
+             "הצמיחה העתידית מצדיקה את המחיר."),
+            ({"trailingPegRatio": 1.5}, "warning",
+             "**תמחור: בינוני / הוגן (PEG בין 1 ל-2)**",
+             "המחיר אינו זול במיוחד אך גם לא מנופח."),
+            ({"trailingPegRatio": 2.7}, "error",
+             "**תמחור: מנופח / פרמיה (PEG מעל 2)**",
+             "מעל 2 אתם משלמים פרמיה אמיתית על החברה!"),
+            ({"trailingEps": -1.2, "trailingPegRatio": 0.6}, "error",
+             "**תמחור: חברה מפסידה או בצמיחה שלילית**",
+             "ולכן מכפיל הרווח אינו תקף."),
+            ({"trailingPE": 25.0}, "info",
+             "**תמחור: נתונים חסרים**",
+             "נפוץ בתעודות סל או בחברות ללא כיסוי אנליסטים"),
+        ],
+    )
+    def test_status_box_per_tier(self, monkeypatch, info, box, heading, body):
+        at = self.check(monkeypatch, info)
+        boxes = [str(e.value) for e in getattr(at, box)]
+        match = [b for b in boxes if b.startswith(heading)]
+        assert len(match) == 1
+        assert body in match[0]
+        # Exactly one valuation verdict on the page, in the expected box type.
+        alerts = [
+            str(e.value)
+            for kind in ("success", "warning", "error", "info")
+            for e in getattr(at, kind)
+        ]
+        assert sum(a.startswith("**תמחור:") for a in alerts) == 1
+
+    def test_valuation_does_not_change_the_technical_level(self, monkeypatch):
+        at = self.check(monkeypatch, {"trailingPegRatio": 2.7})  # EXPENSIVE
+        assert "מתאימה להמשך בדיקה" in text_of(at.success)       # still GREEN
+        assert {"approve", "veto"} <= button_keys(at)
+
+    def test_valuation_is_rendered_for_a_red_stock(self, monkeypatch):
+        at = self.check(monkeypatch, {"trailingPegRatio": 0.6}, closes=DOWNTREND)
+        assert "על הגדר" in text_of(at.error)  # technical RED
+        assert VALUATION_TITLE in text_of(at.subheader)
+        assert self.metric(at, PEG_LABEL).value == "0.60"
+        assert "**תמחור: מחיר טוב / אטרקטיבי" in text_of(at.success)
+        # ...and the flow still stops after it.
+        assert {"approve", "veto"}.isdisjoint(button_keys(at))
+        assert "חדשות ואזהרות" not in text_of(at.subheader)
+
+    def test_valuation_sits_between_report_and_news(self, monkeypatch):
+        at = self.check(monkeypatch, FULL_INFO)
+        titles = [str(s.value) for s in at.subheader]
+        assert (
+            titles.index("דוח לימודי טכני: NVDA")
+            < titles.index(VALUATION_TITLE)
+            < titles.index("חדשות ואזהרות")
+        )
+
+    def test_info_failure_degrades_to_unknown_without_error(self, monkeypatch):
+        at = self.check(monkeypatch, info_exc=RuntimeError("Yahoo flaked"))
+        assert "**תמחור: נתונים חסרים**" in text_of(at.info)
+        assert self.metric(at, PEG_LABEL).value == "לא זמין"
+        assert {"approve", "veto"} <= button_keys(at)  # flow continues
+
+    def test_valuation_persists_after_approval(self, monkeypatch):
+        at = self.check(monkeypatch, FULL_INFO)
+        at.button(key="approve").click()
+        at.run()
+        assert not at.exception
+        assert self.metric(at, PEG_LABEL).value == "1.46"
+        assert RISK_TITLE in page_text(at)
+
+    def test_valuation_shown_with_close_earnings(self, monkeypatch):
+        at = self.check(
+            monkeypatch, FULL_INFO,
+            calendar={"Earnings Date": [days_from_today(5)]},
+        )
+        assert EARNINGS_CONTINUES in text_of(at.error)
+        assert VALUATION_TITLE in text_of(at.subheader)
+
+
+# ---------------------------------------------------------------------------
 # News & veto (Human-in-the-Loop) + capital shield
 # ---------------------------------------------------------------------------
 

@@ -566,12 +566,22 @@ def _clean_float(val: object) -> float | None:
 
 def classify_valuation(
     trailing_pe: float | None,
-    forward_pe: float | None,  # noqa: ARG001 - kept for a stable signature
+    forward_pe: float | None,
     peg_ratio: float | None,
     trailing_eps: float | None,
+    forward_eps: float | None = None,
 ) -> ValuationTier:
-    """Map the multiples to a tier. PEG decides; P/E alone is never enough."""
+    """Map the multiples to a tier. PEG decides; P/E alone is never enough.
+
+    Any sign of losses - past (trailing EPS) or expected (forward EPS or
+    forward P/E) - wins over the PEG, so a company expected to lose money
+    is never shown as attractive or fair.
+    """
     if trailing_eps is not None and trailing_eps <= 0:
+        return ValuationTier.UNPROFITABLE
+    if (forward_eps is not None and forward_eps <= 0) or (
+        forward_pe is not None and forward_pe <= 0
+    ):
         return ValuationTier.UNPROFITABLE
     if peg_ratio is not None:
         if peg_ratio <= 0:  # negative earnings or negative growth
@@ -597,9 +607,13 @@ def fetch_valuation(ticker: str) -> Valuation:
         forward_pe = _clean_float(info.get("forwardPE"))
         trailing_eps = _clean_float(info.get("trailingEps"))
         forward_eps = _clean_float(info.get("forwardEps"))
+        # Explicit None check, not `or`: a reported PEG of 0.0 is falsy but
+        # is real data (it classifies as UNPROFITABLE) and must be kept.
+        trailing_peg = _clean_float(info.get("trailingPegRatio"))
         peg_ratio = (
-            _clean_float(info.get("trailingPegRatio"))
-            or _clean_float(info.get("pegRatio"))
+            trailing_peg
+            if trailing_peg is not None
+            else _clean_float(info.get("pegRatio"))
         )
         if (
             peg_ratio is None
@@ -611,7 +625,9 @@ def fetch_valuation(ticker: str) -> Valuation:
             growth_pct = ((forward_eps / trailing_eps) - 1.0) * 100.0
             if growth_pct > 0:
                 peg_ratio = forward_pe / growth_pct
-        tier = classify_valuation(trailing_pe, forward_pe, peg_ratio, trailing_eps)
+        tier = classify_valuation(
+            trailing_pe, forward_pe, peg_ratio, trailing_eps, forward_eps
+        )
         return Valuation(
             trailing_pe, forward_pe, peg_ratio, trailing_eps, forward_eps, tier
         )

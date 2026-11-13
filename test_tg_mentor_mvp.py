@@ -799,6 +799,24 @@ class TestClassifyValuation:
     def test_non_positive_pe_without_peg_is_unprofitable(self, pe):
         assert tg.classify_valuation(pe, None, None, None) is T.UNPROFITABLE
 
+    @pytest.mark.parametrize("forward_eps", [0.0, -0.5])
+    @pytest.mark.parametrize("peg", [0.5, 1.5, 3.0, None])
+    def test_expected_loss_by_forward_eps_is_unprofitable(self, forward_eps, peg):
+        assert (
+            tg.classify_valuation(20.0, 18.0, peg, 5.0, forward_eps) is T.UNPROFITABLE
+        )
+
+    @pytest.mark.parametrize("forward_pe", [0.0, -18.0])
+    @pytest.mark.parametrize("peg", [0.5, 1.5, 3.0, None])
+    def test_expected_loss_by_forward_pe_is_unprofitable(self, forward_pe, peg):
+        assert tg.classify_valuation(20.0, forward_pe, peg, 5.0) is T.UNPROFITABLE
+
+    def test_positive_forward_eps_does_not_change_the_peg_tier(self):
+        assert tg.classify_valuation(20.0, 18.0, 0.5, 5.0, 6.0) is T.ATTRACTIVE
+
+    def test_forward_eps_is_optional(self):
+        assert tg.classify_valuation(20.0, 18.0, 1.5, 5.0) is T.FAIR
+
     def test_peg_wins_over_trailing_pe_sign(self):
         assert tg.classify_valuation(-5.0, 10.0, 1.5, None) is T.FAIR
 
@@ -830,7 +848,33 @@ class TestFetchValuation:
         v = self.fetch(monkeypatch, info={"trailingPegRatio": 0.8, "pegRatio": 3.0})
         assert v.peg_ratio == 0.8 and v.tier is T.ATTRACTIVE
 
-    @pytest.mark.parametrize("trailing_peg", [None, float("nan"), 0.0])
+    def test_zero_trailing_peg_is_kept_and_unprofitable(self, monkeypatch):
+        # 0.0 is falsy: an `or` chain would skip it to pegRatio (-> EXPENSIVE)
+        # or to the EPS-growth fallback (20 / 50 = 0.4 -> ATTRACTIVE).
+        v = self.fetch(monkeypatch, info={
+            "trailingPegRatio": 0.0, "pegRatio": 3.0,
+            "forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 6.0,
+        })
+        assert v.peg_ratio == 0.0
+        assert v.peg_ratio is not None
+        assert v.tier is T.UNPROFITABLE
+
+    def test_zero_trailing_peg_alone_is_kept(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={"trailingPegRatio": 0.0})
+        assert v.peg_ratio == 0.0 and v.tier is T.UNPROFITABLE
+
+    def test_expected_loss_overrides_a_good_peg(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={
+            "trailingPE": 30.0, "trailingEps": 4.0, "trailingPegRatio": 0.6,
+            "forwardPE": -12.0, "forwardEps": -1.5,
+        })
+        assert v.peg_ratio == 0.6 and v.tier is T.UNPROFITABLE
+
+    def test_negative_forward_eps_alone_is_unprofitable(self, monkeypatch):
+        v = self.fetch(monkeypatch, info={"pegRatio": 1.2, "forwardEps": -0.4})
+        assert v.tier is T.UNPROFITABLE
+
+    @pytest.mark.parametrize("trailing_peg", [None, float("nan")])
     def test_falls_back_to_legacy_peg_key(self, monkeypatch, trailing_peg):
         v = self.fetch(
             monkeypatch, info={"trailingPegRatio": trailing_peg, "pegRatio": 3.0}
@@ -858,7 +902,6 @@ class TestFetchValuation:
         [
             {"forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 4.0},   # flat
             {"forwardPE": 20.0, "trailingEps": 4.0, "forwardEps": 3.0},   # shrinking
-            {"forwardPE": -20.0, "trailingEps": 4.0, "forwardEps": 6.0},  # bad P/E
             {"forwardPE": 20.0, "trailingEps": 4.0},                      # no forecast
             {"trailingEps": 4.0, "forwardEps": 6.0},                      # no fwd P/E
         ],
@@ -866,6 +909,14 @@ class TestFetchValuation:
     def test_no_fallback_peg_without_positive_growth(self, monkeypatch, info):
         v = self.fetch(monkeypatch, info=info)
         assert v.peg_ratio is None and v.tier is T.UNKNOWN
+
+    def test_negative_forward_pe_gets_no_fallback_peg_and_is_unprofitable(
+        self, monkeypatch
+    ):
+        v = self.fetch(monkeypatch, info={
+            "forwardPE": -20.0, "trailingEps": 4.0, "forwardEps": 6.0,
+        })
+        assert v.peg_ratio is None and v.tier is T.UNPROFITABLE
 
     def test_losing_company_is_unprofitable_and_gets_no_fallback_peg(self, monkeypatch):
         v = self.fetch(monkeypatch, info={
