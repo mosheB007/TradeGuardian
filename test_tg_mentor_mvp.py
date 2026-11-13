@@ -1124,21 +1124,23 @@ class TestRiskPlanAtCustomEntry:
 class TestComputeEntryPlan:
     def test_all_conditions_met(self):
         plan = tg.compute_entry_plan(entry_snap(), False, T.FAIR)
-        assert condition_states(plan) == [True] * 5
+        assert condition_states(plan) == [True] * 6
         assert not plan.falling_knife
 
     def test_five_conditions_with_hebrew_labels(self):
         labels = [c.label for c in tg.compute_entry_plan(entry_snap()).conditions]
-        assert len(labels) == 5
+        assert len(labels) == 6
         assert "ממוצע 50" in labels[0]
         assert "פאניקה" in labels[1]
         assert "5 ימי המסחר" in labels[2]
-        assert "14 הימים" in labels[3]
-        assert "PEG" in labels[4]
+        assert "פחות מ-15% מתחת לממוצע 50" in labels[3]
+        assert "14 הימים" in labels[4]
+        assert "PEG" in labels[5]
 
     def test_trend_condition_follows_sma(self):
         plan = tg.compute_entry_plan(entry_snap(close=95.0, low_20=90.0))
         assert plan.conditions[0].ok is False
+        assert plan.conditions[3].ok is True  # only 5% below: not "far"
 
     # Panic day needs BOTH a >= 1.5 x ATR drop AND >= 1.5 x average volume.
     @pytest.mark.parametrize(
@@ -1176,7 +1178,7 @@ class TestComputeEntryPlan:
         "blocked, expected", [(False, True), (True, False), (None, None)]
     )
     def test_earnings_condition(self, blocked, expected):
-        assert tg.compute_entry_plan(entry_snap(), blocked).conditions[3].ok is expected
+        assert tg.compute_entry_plan(entry_snap(), blocked).conditions[4].ok is expected
 
     @pytest.mark.parametrize(
         "tier, expected",
@@ -1185,11 +1187,52 @@ class TestComputeEntryPlan:
     )
     def test_valuation_condition(self, tier, expected):
         plan = tg.compute_entry_plan(entry_snap(), False, tier)
-        assert plan.conditions[4].ok is expected
+        assert plan.conditions[5].ok is expected
 
     def test_earnings_and_valuation_never_make_a_falling_knife(self):
         plan = tg.compute_entry_plan(entry_snap(), True, T.UNPROFITABLE)
         assert not plan.falling_knife
+
+    # --- far below SMA_50 (plain percent, independent of ATR) ---
+
+    @pytest.mark.parametrize(
+        "close, far",
+        [(85.0, True), (84.99, True), (60.0, True), (85.01, False), (99.0, False),
+         (110.0, False)],
+    )
+    def test_far_below_sma_boundary_is_15_percent(self, close, far):
+        # SMA_50 = 100, so the threshold is exactly 85.00. Quiet tape otherwise.
+        plan = tg.compute_entry_plan(entry_snap(
+            close=close, sma_50=100.0, prev_close=close + 0.1,
+            close_slide_ago=close + 0.2, low_20=close - 5.0,
+        ))
+        assert plan.far_below_sma is far
+        assert plan.conditions[3].ok is (not far)
+        assert plan.falling_knife is far
+        assert plan.conditions[1].ok is True and plan.conditions[2].ok is True
+
+    def test_far_below_sma_uses_the_conditional_knife_price(self):
+        plan = tg.compute_entry_plan(entry_snap(
+            close=80.0, sma_50=100.0, atr=2.0, prev_close=80.1,
+            close_slide_ago=80.2, low_20=79.5,
+        ))
+        assert plan.limit_price == pytest.approx(76.0)  # 80 - 2*2, not the 79.5 support
+
+    def test_inflated_atr_cannot_hide_a_collapse(self):
+        # The real NVDA case (2026-11-12): -23% vs SMA_50, but a crash-inflated
+        # ATR keeps both ATR-based tests quiet.
+        s = entry_snap(
+            close=166.19, sma_50=215.94, atr=9.86, prev_close=173.73,
+            close_slide_ago=181.6, low_20=165.89,
+            volume=742_789_000.0, volume_sma_20=196_371_420.0,
+        )
+        plan = tg.compute_entry_plan(s)
+        assert plan.conditions[1].ok is True and plan.conditions[2].ok is True
+        assert plan.far_below_sma and plan.falling_knife
+        assert plan.limit_price == pytest.approx(round(166.19 - 2 * 9.86, 2))
+
+    def test_zero_sma_is_never_far_below(self):
+        assert not tg.compute_entry_plan(entry_snap(sma_50=0.0)).far_below_sma
 
     # --- limit price, normal state: max(nearest support, close - 1 x ATR) ---
 

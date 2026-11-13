@@ -99,6 +99,12 @@ KNIFE_DAY_DROP_ATR = 1.5         # one-day drop >= 1.5 x ATR ...
 KNIFE_DAY_VOLUME_RATIO = 1.5     # ... on volume >= 1.5 x its 20-day average
 KNIFE_SLIDE_DAYS = 5             # or, over the last 5 sessions,
 KNIFE_SLIDE_ATR = 3.0            # a decline >= 3 x ATR
+# ATR balloons during a crash, which makes the two ATR-based tests above harder
+# to trip exactly when they matter, so distance from SMA_50 is tested in plain
+# percent. Calibrated on 56 US tickers, 2017-2026 (see PRD 3.G): at 15% or more
+# below SMA_50 the stock fell a further 10%+ within 10 sessions in ~37% of
+# days (~33% on the first day of an episode) vs ~12% of all days.
+KNIFE_SMA_DISTANCE = 0.15        # close 15%+ below SMA_50
 ENTRY_PULLBACK_ATR = 1.0         # normal limit: at most 1 x ATR below the close
 ENTRY_KNIFE_DISCOUNT_ATR = 2.0   # falling knife: 2 x ATR below the close
 
@@ -914,9 +920,10 @@ class EntryCondition:
 @dataclass(frozen=True)
 class EntryPlan:
     conditions: tuple[EntryCondition, ...]
-    falling_knife: bool           # panic day or sharp multi-day slide
+    falling_knife: bool           # panic day, sharp slide or far below SMA_50
     support: float | None         # nearest support level below the close
     limit_price: float            # suggested limit-order reference price
+    far_below_sma: bool = False   # close KNIFE_SMA_DISTANCE or more below SMA_50
 
 
 def _is_panic_day(s: Snapshot) -> bool | None:
@@ -938,6 +945,11 @@ def _is_sharp_slide(s: Snapshot) -> bool | None:
     return s.close_slide_ago - s.close >= KNIFE_SLIDE_ATR * s.atr_14
 
 
+def _is_far_below_sma(s: Snapshot) -> bool:
+    """Close is KNIFE_SMA_DISTANCE (15%) or more below SMA_50."""
+    return s.sma_50 > 0 and s.close <= s.sma_50 * (1 - KNIFE_SMA_DISTANCE)
+
+
 def _negate(value: bool | None) -> bool | None:
     return None if value is None else not value
 
@@ -957,6 +969,7 @@ def compute_entry_plan(
     """
     s = snapshot
     panic, slide = _is_panic_day(s), _is_sharp_slide(s)
+    far_below = _is_far_below_sma(s)
     valuation_ok = {
         ValuationTier.ATTRACTIVE: True,
         ValuationTier.FAIR: True,
@@ -975,12 +988,17 @@ def compute_entry_plan(
             _negate(slide),
         ),
         EntryCondition(
+            f"המחיר אינו רחוק מהממוצע: פחות מ-{KNIFE_SMA_DISTANCE:.0%} "
+            "מתחת לממוצע 50",
+            not far_below,
+        ),
+        EntryCondition(
             f"אין דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים",
             _negate(earnings_blocked),
         ),
         EntryCondition("התמחור אינו מנופח והחברה רווחית (לפי PEG)", valuation_ok),
     )
-    falling_knife = panic is True or slide is True
+    falling_knife = panic is True or slide is True or far_below
 
     levels = [lvl for lvl in (s.sma_50, s.low_20) if lvl is not None and lvl < s.close]
     support = max(levels, default=None)
@@ -992,7 +1010,7 @@ def compute_entry_plan(
             limit = max(support, limit)
     if limit <= 0:  # degenerate data: never suggest a non-positive price
         limit = s.close
-    return EntryPlan(conditions, falling_knife, support, round(limit, 2))
+    return EntryPlan(conditions, falling_knife, support, round(limit, 2), far_below)
 
 
 # ---------------------------------------------------------------------------

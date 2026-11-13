@@ -652,6 +652,8 @@ CONDITIONAL_HEADING = "**תוכנית מותנית - התנאים אינם מת�
 # Uptrend, then a crash on 4x volume: still above SMA_50 (not RED).
 KNIFE_CLOSES = np.r_[np.linspace(100, 200, 119), 185.0]
 KNIFE_VOLUMES = np.r_[np.full(119, 1_000_000.0), 4_000_000.0]
+# Below SMA_50 (RED) but only ~3% under it: a slow, shallow downtrend.
+MILD_DOWNTREND = np.linspace(200, 170, 120)
 
 
 def expected_entry(df, earnings_blocked=None, tier=tg.ValuationTier.UNKNOWN):
@@ -694,12 +696,13 @@ class TestEntryPlan:
 
     def test_checklist_shows_met_and_unknown_conditions(self, monkeypatch):
         lines = self.checklist(self.check(monkeypatch)).splitlines()
-        assert len(lines) == 5
+        assert len(lines) == 6
+        assert lines[3].startswith("- ✅ המחיר אינו רחוק מהממוצע")
         assert lines[0].startswith("- ✅ מגמה חיובית")
         assert lines[1].startswith("- ✅ אין ירידת פאניקה")
         assert lines[2].startswith("- ✅ אין צניחה מתמשכת")
-        assert lines[3].startswith("- ❔ אין דוח כספי")   # no earnings date
-        assert lines[4].startswith("- ❔ התמחור")         # no valuation data
+        assert lines[4].startswith("- ❔ אין דוח כספי")   # no earnings date
+        assert lines[5].startswith("- ❔ התמחור")         # no valuation data
 
     def test_checklist_marks_failed_conditions(self, monkeypatch):
         at = self.check(
@@ -709,8 +712,9 @@ class TestEntryPlan:
         )
         lines = self.checklist(at).splitlines()
         assert lines[0].startswith("- ❌ מגמה חיובית")
-        assert lines[3].startswith("- ❌ אין דוח כספי")
-        assert lines[4].startswith("- ❌ התמחור")
+        assert lines[3].startswith("- ❌ המחיר אינו רחוק מהממוצע")  # ~17% below
+        assert lines[4].startswith("- ❌ אין דוח כספי")
+        assert lines[5].startswith("- ❌ התמחור")
 
     def test_checklist_marks_good_earnings_and_valuation(self, monkeypatch):
         at = self.check(
@@ -719,7 +723,7 @@ class TestEntryPlan:
             info={"trailingPegRatio": 0.8},
         )
         lines = self.checklist(at).splitlines()
-        assert lines[3].startswith("- ✅") and lines[4].startswith("- ✅")
+        assert lines[4].startswith("- ✅") and lines[5].startswith("- ✅")
 
     def test_no_verdict_or_score_is_shown(self, monkeypatch):
         text = page_text(self.check(monkeypatch))
@@ -801,10 +805,10 @@ class TestEntryPlan:
         assert {"approve", "veto"} <= button_keys(at)
 
     def test_red_stock_gets_a_conditional_plan_without_sizing(self, monkeypatch):
-        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
-        _, plan = expected_entry(self.df)
+        at = self.check(monkeypatch, closes=MILD_DOWNTREND, volumes=None)
+        snap, plan = expected_entry(self.df)
         risk = expected_risk(self.df)
-        assert not plan.falling_knife  # slow downtrend, not a crash
+        assert not snap.above_sma and not plan.falling_knife  # slow, shallow downtrend
         assert CONDITIONAL_HEADING in text_of(at.error)
         assert metric_value(at, LIMIT_LABEL) == f"{plan.limit_price:,.2f}"
         assert metric_value(at, STOP_LABEL) == f"{risk.stop_loss:,.2f}"
@@ -814,6 +818,29 @@ class TestEntryPlan:
         assert "כמות מניות מקסימלית" not in [m.label for m in at.metric]
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
         assert RISK_TITLE not in page_text(at)
+
+    def test_far_below_sma_shows_the_knife_banner_with_the_statistic(
+        self, monkeypatch
+    ):
+        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
+        snap, plan = expected_entry(self.df)
+        assert plan.far_below_sma and plan.falling_knife
+        assert plan.conditions[1].ok and plan.conditions[2].ok  # no panic, no slide
+        errors = text_of(at.error)
+        assert KNIFE_HEADING in errors and CONDITIONAL_HEADING not in errors
+        below = (1 - snap.close / snap.sma_50) * 100
+        captions = text_of(at.caption)
+        assert f"המחיר נמצא {below:.0f}% מתחת לממוצע 50" in captions
+        assert "באחד מכל שלושה מקרים" in captions and "לא תחזית" in captions
+        assert entry_input(at).value == pytest.approx(
+            round(snap.close - 2 * snap.atr_14, 2)
+        )
+
+    def test_statistic_is_not_shown_for_other_knife_reasons(self, monkeypatch):
+        at = self.check(monkeypatch, closes=KNIFE_CLOSES, volumes=KNIFE_VOLUMES)
+        _, plan = expected_entry(self.df)
+        assert plan.falling_knife and not plan.far_below_sma
+        assert "באחד מכל שלושה מקרים" not in text_of(at.caption)
 
     def test_red_crash_shows_the_knife_banner_not_both(self, monkeypatch):
         closes = np.r_[np.linspace(100, 160, 119), 120.0]

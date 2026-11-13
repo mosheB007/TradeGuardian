@@ -48,6 +48,7 @@ from tg_mentor_mvp import (
     EARNINGS_UNKNOWN_MESSAGE,
     ENTRY_KNIFE_DISCOUNT_ATR,
     ENTRY_PULLBACK_ATR,
+    KNIFE_SMA_DISTANCE,
     EntryPlan,
     LiveQuote,
     SESSION_CLOSED,
@@ -582,6 +583,14 @@ def render_entry_plan(a: Analysis, capital: float, risk_pct: float) -> float:
             "נשבר, מחזור מסחר שנרגע, ונר ירוק שנסגר מעל הגבוה של היום הקודם.",
             icon="🔪",
         )
+        if plan.far_below_sma:
+            below = (1 - s.close / s.sma_50) * 100
+            st.caption(
+                f"המחיר נמצא {below:.0f}% מתחת לממוצע 50. בבדיקה היסטורית של 56 מניות "
+                f"(2017-2026), כשמניה הייתה {KNIFE_SMA_DISTANCE:.0%} ומעלה מתחת לממוצע, "
+                "בערך באחד מכל שלושה מקרים היא ירדה לפחות 10% נוספים בתוך שבועיים. "
+                "זו סטטיסטיקה על העבר, לא תחזית."
+            )
     elif a.level is Level.RED:
         st.error(
             "**תוכנית מותנית - התנאים אינם מתקיימים כרגע**\n\n"
