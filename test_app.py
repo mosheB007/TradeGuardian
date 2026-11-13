@@ -8,6 +8,7 @@ No test touches the network.
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 from streamlit.proto.Metric_pb2 import Metric as MetricProto
 from streamlit.testing.v1 import AppTest
@@ -651,6 +652,8 @@ CONDITIONAL_HEADING = "**תוכנית מותנית - התנאים אינם מת�
 # Uptrend, then a crash on 4x volume: still above SMA_50 (not RED).
 KNIFE_CLOSES = np.r_[np.linspace(100, 200, 119), 185.0]
 KNIFE_VOLUMES = np.r_[np.full(119, 1_000_000.0), 4_000_000.0]
+# Below SMA_50 (RED) but only ~3% under it: a slow, shallow downtrend.
+MILD_DOWNTREND = np.linspace(200, 170, 120)
 
 
 def expected_entry(df, earnings_blocked=None, tier=tg.ValuationTier.UNKNOWN):
@@ -693,12 +696,13 @@ class TestEntryPlan:
 
     def test_checklist_shows_met_and_unknown_conditions(self, monkeypatch):
         lines = self.checklist(self.check(monkeypatch)).splitlines()
-        assert len(lines) == 5
+        assert len(lines) == 6
+        assert lines[3].startswith("- ✅ המחיר אינו רחוק מהממוצע")
         assert lines[0].startswith("- ✅ מגמה חיובית")
         assert lines[1].startswith("- ✅ אין ירידת פאניקה")
         assert lines[2].startswith("- ✅ אין צניחה מתמשכת")
-        assert lines[3].startswith("- ❔ אין דוח כספי")   # no earnings date
-        assert lines[4].startswith("- ❔ התמחור")         # no valuation data
+        assert lines[4].startswith("- ❔ אין דוח כספי")   # no earnings date
+        assert lines[5].startswith("- ❔ התמחור")         # no valuation data
 
     def test_checklist_marks_failed_conditions(self, monkeypatch):
         at = self.check(
@@ -708,8 +712,9 @@ class TestEntryPlan:
         )
         lines = self.checklist(at).splitlines()
         assert lines[0].startswith("- ❌ מגמה חיובית")
-        assert lines[3].startswith("- ❌ אין דוח כספי")
-        assert lines[4].startswith("- ❌ התמחור")
+        assert lines[3].startswith("- ❌ המחיר אינו רחוק מהממוצע")  # ~17% below
+        assert lines[4].startswith("- ❌ אין דוח כספי")
+        assert lines[5].startswith("- ❌ התמחור")
 
     def test_checklist_marks_good_earnings_and_valuation(self, monkeypatch):
         at = self.check(
@@ -718,7 +723,7 @@ class TestEntryPlan:
             info={"trailingPegRatio": 0.8},
         )
         lines = self.checklist(at).splitlines()
-        assert lines[3].startswith("- ✅") and lines[4].startswith("- ✅")
+        assert lines[4].startswith("- ✅") and lines[5].startswith("- ✅")
 
     def test_no_verdict_or_score_is_shown(self, monkeypatch):
         text = page_text(self.check(monkeypatch))
@@ -800,10 +805,10 @@ class TestEntryPlan:
         assert {"approve", "veto"} <= button_keys(at)
 
     def test_red_stock_gets_a_conditional_plan_without_sizing(self, monkeypatch):
-        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
-        _, plan = expected_entry(self.df)
+        at = self.check(monkeypatch, closes=MILD_DOWNTREND, volumes=None)
+        snap, plan = expected_entry(self.df)
         risk = expected_risk(self.df)
-        assert not plan.falling_knife  # slow downtrend, not a crash
+        assert not snap.above_sma and not plan.falling_knife  # slow, shallow downtrend
         assert CONDITIONAL_HEADING in text_of(at.error)
         assert metric_value(at, LIMIT_LABEL) == f"{plan.limit_price:,.2f}"
         assert metric_value(at, STOP_LABEL) == f"{risk.stop_loss:,.2f}"
@@ -813,6 +818,29 @@ class TestEntryPlan:
         assert "כמות מניות מקסימלית" not in [m.label for m in at.metric]
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
         assert RISK_TITLE not in page_text(at)
+
+    def test_far_below_sma_shows_the_knife_banner_with_the_statistic(
+        self, monkeypatch
+    ):
+        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
+        snap, plan = expected_entry(self.df)
+        assert plan.far_below_sma and plan.falling_knife
+        assert plan.conditions[1].ok and plan.conditions[2].ok  # no panic, no slide
+        errors = text_of(at.error)
+        assert KNIFE_HEADING in errors and CONDITIONAL_HEADING not in errors
+        below = (1 - snap.close / snap.sma_50) * 100
+        captions = text_of(at.caption)
+        assert f"המחיר נמצא {below:.0f}% מתחת לממוצע 50" in captions
+        assert "באחד מכל שלושה מקרים" in captions and "לא תחזית" in captions
+        assert entry_input(at).value == pytest.approx(
+            round(snap.close - 2 * snap.atr_14, 2)
+        )
+
+    def test_statistic_is_not_shown_for_other_knife_reasons(self, monkeypatch):
+        at = self.check(monkeypatch, closes=KNIFE_CLOSES, volumes=KNIFE_VOLUMES)
+        _, plan = expected_entry(self.df)
+        assert plan.falling_knife and not plan.far_below_sma
+        assert "באחד מכל שלושה מקרים" not in text_of(at.caption)
 
     def test_red_crash_shows_the_knife_banner_not_both(self, monkeypatch):
         closes = np.r_[np.linspace(100, 160, 119), 120.0]
@@ -854,6 +882,277 @@ class TestEntryPlan:
         _, plan = expected_entry(self.df)
         assert entry_input(at).key.startswith("entry_AMD_")
         assert entry_input(at).value == pytest.approx(plan.limit_price)
+
+
+# ---------------------------------------------------------------------------
+# Live price (current quote, refresh button, open-session indicators)
+# ---------------------------------------------------------------------------
+
+LIVE_LABEL = "מחיר נוכחי: NVDA"
+NO_LIVE_PRICE = "לא ניתן לקבל מחיר נוכחי כרגע"
+DELAY_NOTE = "ייתכן עיכוב של עד כרבע שעה"
+OPEN_SESSION_NOTE = "המסחר פתוח: האינדיקטורים כוללים את הנר החלקי של היום"
+BELOW_STOP = "כבר מתחת לסטופ-לוס"
+Q_TIME = 1794560400  # 2026-11-13 09:00 UTC = 11:00 in Israel (winter time)
+
+
+def live_metric(at):
+    return next(m for m in at.metric if m.label == LIVE_LABEL)
+
+
+class TestLiveQuote:
+    def check(self, monkeypatch, info=None, closes=GREEN_CLOSES, volumes=GREEN_VOLUMES,
+              **kwargs):
+        self.df = make_ohlcv(closes, volumes)
+        patch_market(monkeypatch, history_result=self.df, info=info, **kwargs)
+        return run_check()
+
+    def test_regular_session_price_and_change(self, monkeypatch):
+        at = self.check(monkeypatch, {
+            "marketState": "REGULAR", "regularMarketPrice": 166.19,
+            "regularMarketPreviousClose": 173.73, "regularMarketTime": Q_TIME,
+        })
+        metric = live_metric(at)
+        assert metric.value == "166.19"
+        assert metric.proto.delta == "-$7.54 (-4.34%)"
+        assert metric.proto.direction == MetricProto.MetricDirection.DOWN
+        captions = text_of(at.caption)
+        assert "מסחר רגיל" in captions
+        assert "עודכן 13/11 11:00 (שעון ישראל)" in captions
+        assert DELAY_NOTE in captions
+        assert "דליל ותנודתי" not in captions
+        assert NO_LIVE_PRICE not in text_of(at.warning)
+
+    def test_gain_is_shown_as_positive(self, monkeypatch):
+        at = self.check(monkeypatch, {
+            "marketState": "REGULAR", "regularMarketPrice": 110.0,
+            "regularMarketPreviousClose": 100.0,
+        })
+        assert live_metric(at).proto.delta == "+$10.00 (+10.00%)"
+        assert live_metric(at).proto.direction == MetricProto.MetricDirection.UP
+
+    def test_pre_market_is_labelled_and_warned(self, monkeypatch):
+        at = self.check(monkeypatch, {
+            "marketState": "PRE", "preMarketPrice": 160.5, "preMarketTime": Q_TIME,
+            "regularMarketPrice": 166.19,
+        })
+        assert live_metric(at).value == "160.50"
+        assert live_metric(at).proto.delta == "-$5.69 (-3.42%)"
+        captions = text_of(at.caption)
+        assert "מסחר מוקדם (Pre-Market)" in captions
+        assert "דליל ותנודתי" in captions and "אינו נכלל באינדיקטורים" in captions
+
+    def test_after_hours_is_labelled_and_warned(self, monkeypatch):
+        at = self.check(monkeypatch, {
+            "marketState": "POST", "postMarketPrice": 164.0,
+            "regularMarketPrice": 166.19,
+        })
+        assert live_metric(at).value == "164.00"
+        captions = text_of(at.caption)
+        assert "מסחר מאוחר (After-Hours)" in captions and "דליל ותנודתי" in captions
+
+    def test_closed_market_shows_the_last_close_without_a_change(self, monkeypatch):
+        at = self.check(
+            monkeypatch, {"marketState": "CLOSED", "regularMarketPrice": 166.19}
+        )
+        assert live_metric(at).value == "166.19"
+        assert live_metric(at).proto.delta == ""
+        assert "השוק סגור - סגירה אחרונה" in text_of(at.caption)
+
+    def test_minute_bar_fallback_is_shown_as_last_price(self, monkeypatch):
+        bars = pd.DataFrame(
+            {"Close": [161.25]},
+            index=pd.DatetimeIndex(["2026-11-13 08:00"], tz="America/New_York"),
+        )
+        at = self.check(monkeypatch, info={}, minute_result=bars)
+        assert live_metric(at).value == "161.25"
+        captions = text_of(at.caption)
+        assert "מחיר אחרון" in captions and "עודכן 13/11 15:00" in captions
+
+    def test_no_quote_warns_and_the_analysis_continues(self, monkeypatch):
+        at = self.check(monkeypatch, info_exc=RuntimeError("Yahoo flaked"))
+        assert NO_LIVE_PRICE in text_of(at.warning)
+        assert LIVE_LABEL not in [m.label for m in at.metric]
+        assert "דוח לימודי טכני: NVDA" in text_of(at.subheader)
+        assert {"approve", "veto"} <= button_keys(at)
+
+    def test_quote_and_valuation_share_one_info_request(self, monkeypatch):
+        calls = []
+
+        class CountingTicker(FakeTicker):
+            @property
+            def info(self):
+                calls.append(1)
+                return {"marketState": "REGULAR", "regularMarketPrice": 9.0,
+                        "trailingPegRatio": 0.8}
+
+        df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)
+        monkeypatch.setattr(
+            tg.yf, "Ticker", lambda symbol: CountingTicker(history_result=df)
+        )
+        at = run_check()
+        assert len(calls) == 1
+        assert live_metric(at).value == "9.00"
+        assert "**תמחור: מחיר טוב / אטרקטיבי" in text_of(at.success)
+
+    def test_live_price_sits_above_the_technical_report(self, monkeypatch):
+        at = self.check(monkeypatch, {"marketState": "REGULAR", "regularMarketPrice": 9.0})
+        labels = [m.label for m in at.metric]
+        assert labels.index(LIVE_LABEL) < labels.index("מחיר סגירה אחרון")
+
+    # --- refresh ---
+
+    def test_refresh_button_is_offered_only_after_a_check(self, monkeypatch):
+        assert "refresh" not in button_keys(new_app())
+        at = self.check(monkeypatch)
+        assert at.button(key="refresh").label == "רענן מחיר"
+
+    def refreshing_market(self, monkeypatch, prices):
+        """Each `.info` read returns the next price in `prices`."""
+        feed = iter(prices)
+        self.df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)
+
+        class MovingTicker(FakeTicker):
+            @property
+            def info(self):
+                return {"marketState": "REGULAR", "regularMarketPrice": next(feed)}
+
+        monkeypatch.setattr(
+            tg.yf, "Ticker", lambda symbol: MovingTicker(history_result=self.df)
+        )
+
+    def test_refresh_fetches_a_new_price(self, monkeypatch):
+        self.refreshing_market(monkeypatch, [150.0, 151.5])
+        at = run_check()
+        assert live_metric(at).value == "150.00"
+        at.button(key="refresh").click()
+        at.run()
+        assert not at.exception
+        assert live_metric(at).value == "151.50"
+
+    def test_refresh_keeps_the_decision_and_the_planned_entry(self, monkeypatch):
+        self.refreshing_market(monkeypatch, [150.0, 151.5])
+        at = run_check()
+        entry_input(at).set_value(140.0)
+        at.run()
+        at.button(key="approve").click()
+        at.run()
+        at.button(key="refresh").click()
+        at.run()
+        assert not at.exception
+        assert live_metric(at).value == "151.50"
+        assert RISK_TITLE in page_text(at)                    # still approved
+        assert entry_input(at).value == pytest.approx(140.0)  # still the user's price
+        assert {"approve", "veto"}.isdisjoint(button_keys(at))
+
+    def test_refresh_uses_the_analysed_ticker_not_the_text_box(self, monkeypatch):
+        self.refreshing_market(monkeypatch, [150.0, 151.5])
+        at = run_check()
+        at.text_input(key="ticker").input("AMD")
+        at.run()
+        at.button(key="refresh").click()
+        at.run()
+        assert "דוח לימודי טכני: NVDA" in text_of(at.subheader)
+
+    def test_failed_refresh_keeps_the_previous_analysis(self, monkeypatch):
+        at = self.check(monkeypatch, {"marketState": "REGULAR", "regularMarketPrice": 9.0})
+        patch_market(monkeypatch, history_exc=ConnectionError("down"))
+        at.button(key="refresh").click()
+        at.run()
+        assert not at.exception
+        assert "הרענון נכשל כרגע" in text_of(at.warning)
+        assert live_metric(at).value == "9.00"
+        assert "דוח לימודי טכני: NVDA" in text_of(at.subheader)
+        assert not [e for e in at.error if "רשת" in str(e.value)]
+
+    def test_new_check_after_refresh_still_resets_the_decision(self, monkeypatch):
+        self.refreshing_market(monkeypatch, [150.0, 151.5, 152.0])
+        at = run_check()
+        at.button(key="approve").click()
+        at.run()
+        at.button(key="refresh").click()
+        at.run()
+        at.button(key="check").click()
+        at.run()
+        assert RISK_TITLE not in page_text(at)
+        assert {"approve", "veto"} <= button_keys(at)
+
+    # --- current price vs. the entry plan ---
+
+    def plan_numbers(self):
+        _, plan = expected_entry(self.df)
+        return plan.limit_price, expected_risk(self.df).stop_loss
+
+    def test_price_above_the_limit_shows_the_distance(self, monkeypatch):
+        at = self.check(monkeypatch, {"marketState": "REGULAR", "regularMarketPrice": 160.0})
+        limit, _ = self.plan_numbers()
+        gap = (160.0 / limit - 1) * 100
+        assert f"המחיר הנוכחי 160.00 - {gap:.1f}% מעל מחיר ה-Limit" in text_of(at.caption)
+        assert BELOW_STOP not in text_of(at.error)
+
+    def test_price_at_or_below_the_limit_says_it_would_fill(self, monkeypatch):
+        self.df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)
+        limit, stop = self.plan_numbers()
+        price = round((limit + stop) / 2, 2)
+        at = self.check(monkeypatch, {"marketState": "PRE", "preMarketPrice": price,
+                                      "regularMarketPrice": 154.0})
+        infos = text_of(at.info)
+        assert f"המחיר הנוכחי ({price:,.2f}) כבר ברמת ה-Limit ({limit:,.2f})" in infos
+        assert BELOW_STOP not in text_of(at.error)
+
+    def test_price_below_the_stop_invalidates_the_plan(self, monkeypatch):
+        self.df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)
+        _, stop = self.plan_numbers()
+        at = self.check(monkeypatch, {"marketState": "PRE", "preMarketPrice": 120.0,
+                                      "regularMarketPrice": 154.0})
+        errors = text_of(at.error)
+        assert f"**המחיר הנוכחי (120.00) {BELOW_STOP} ({stop:,.2f}).**" in errors
+        assert "התוכנית הזו אינה תקפה כרגע" in errors
+
+    def test_no_comparison_without_a_quote(self, monkeypatch):
+        at = self.check(monkeypatch)
+        assert "המחיר הנוכחי" not in page_text(at)
+
+
+class TestOpenSession:
+    def check_open(self, monkeypatch, closes, volumes):
+        self.df = make_ohlcv(closes, volumes)  # last bar: 2026-10-08
+        monkeypatch.setattr(
+            tg, "_now", lambda tz: pd.Timestamp("2026-10-08 11:00", tz=tz)
+        )
+        patch_market(monkeypatch, history_result=self.df)
+        return run_check()
+
+    def test_indicators_include_todays_partial_bar(self, monkeypatch):
+        closes = np.r_[UPTREND[:-1], 190.0]
+        at = self.check_open(monkeypatch, closes, None)
+        assert OPEN_SESSION_NOTE in text_of(at.info)
+        assert "ולכן הניתוח מבוסס על יום המסחר המלא האחרון" not in page_text(at)
+        live = tg.latest_snapshot(tg.compute_indicators(self.df))
+        assert metric_value(at, "מחיר סגירה אחרון") == "190.00"
+        assert metric_value(at, "ממוצע נע 50 יום (SMA 50)") == f"{live.sma_50:,.2f}"
+        assert "יום המסחר האחרון בנתונים: 2026-10-08" in text_of(at.caption)
+
+    def test_volume_comes_from_the_last_completed_day(self, monkeypatch):
+        volumes = np.r_[np.full(118, 1_000_000.0), 2_000_000.0, 12_345.0]
+        at = self.check_open(monkeypatch, UPTREND, volumes)
+        assert metric_value(at, "מחזור מסחר אחרון") == "2,000,000"
+
+    def test_partial_volume_cannot_fake_a_green_level(self, monkeypatch):
+        volumes = np.r_[np.full(118, 1_000_000.0), 3_000_000.0, 10_000.0]
+        at = self.check_open(monkeypatch, GREEN_CLOSES, volumes)
+        assert "דורשת זהירות" in text_of(at.warning)        # YELLOW
+        assert "מתאימה להמשך בדיקה" not in text_of(at.success)
+
+    def test_intraday_crash_raises_the_knife_warning_without_volume(self, monkeypatch):
+        closes = np.r_[np.linspace(100, 200, 119), 185.0]   # still above SMA_50
+        volumes = np.r_[np.full(119, 1_000_000.0), 5_000.0]  # tiny partial volume
+        at = self.check_open(monkeypatch, closes, volumes)
+        assert KNIFE_HEADING in text_of(at.error)
+
+    def test_closed_session_shows_no_open_note(self, monkeypatch):
+        patch_market(monkeypatch, history_result=make_ohlcv(UPTREND))
+        assert OPEN_SESSION_NOTE not in page_text(run_check())
 
 
 # ---------------------------------------------------------------------------

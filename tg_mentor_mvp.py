@@ -57,8 +57,8 @@ import re
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from datetime import date, datetime, time
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from urllib.parse import urlencode
@@ -99,6 +99,12 @@ KNIFE_DAY_DROP_ATR = 1.5         # one-day drop >= 1.5 x ATR ...
 KNIFE_DAY_VOLUME_RATIO = 1.5     # ... on volume >= 1.5 x its 20-day average
 KNIFE_SLIDE_DAYS = 5             # or, over the last 5 sessions,
 KNIFE_SLIDE_ATR = 3.0            # a decline >= 3 x ATR
+# ATR balloons during a crash, which makes the two ATR-based tests above harder
+# to trip exactly when they matter, so distance from SMA_50 is tested in plain
+# percent. Calibrated on 56 US tickers, 2017-2026 (see PRD 3.G): at 15% or more
+# below SMA_50 the stock fell a further 10%+ within 10 sessions in ~37% of
+# days (~33% on the first day of an episode) vs ~12% of all days.
+KNIFE_SMA_DISTANCE = 0.15        # close 15%+ below SMA_50
 ENTRY_PULLBACK_ATR = 1.0         # normal limit: at most 1 x ATR below the close
 ENTRY_KNIFE_DISCOUNT_ATR = 2.0   # falling knife: 2 x ATR below the close
 
@@ -187,6 +193,9 @@ class Snapshot:
     # Entry planning (optional so older callers keep working):
     low_20: float | None = None           # lowest low of the previous 20 sessions
     close_slide_ago: float | None = None  # close KNIFE_SLIDE_DAYS sessions ago
+    # True when `close` comes from today's still-open session (GUI live mode);
+    # the volume fields then describe the last completed session.
+    partial_session: bool = False
 
     @property
     def daily_change(self) -> float | None:
@@ -625,7 +634,14 @@ def classify_valuation(
 def fetch_valuation(ticker: str) -> Valuation:
     """Best-effort valuation multiples from Yahoo. Never raises."""
     try:
-        info = yf.Ticker(ticker).info
+        return valuation_from_info(yf.Ticker(ticker).info)
+    except Exception:  # noqa: BLE001 - unstable endpoint must never crash the CLI
+        return Valuation()
+
+
+def valuation_from_info(info: object) -> Valuation:
+    """Build a Valuation from an already-fetched `.info` dict. Never raises."""
+    try:
         if not isinstance(info, dict):
             return Valuation()
         trailing_pe = _clean_float(info.get("trailingPE"))
@@ -658,6 +674,152 @@ def fetch_valuation(ticker: str) -> Valuation:
         )
     except Exception:  # noqa: BLE001 - unstable endpoint must never crash the CLI
         return Valuation()
+
+
+# ---------------------------------------------------------------------------
+# Live price layer (GUI) - best-effort, never raises
+#
+# Yahoo is an unofficial source: the price may lag by up to ~15 minutes and
+# the endpoint may be missing fields or rate-limited. Everything here
+# degrades to "no quote" rather than failing the analysis.
+# ---------------------------------------------------------------------------
+
+SESSION_PRE, SESSION_REGULAR, SESSION_POST = "pre", "regular", "post"
+SESSION_CLOSED, SESSION_UNKNOWN = "closed", "unknown"
+
+
+@dataclass(frozen=True)
+class LiveQuote:
+    """The most recent price Yahoo reports, including extended hours."""
+
+    price: float
+    session: str                           # one of the SESSION_* constants
+    time: datetime | None = None           # timezone-aware (UTC); None if unknown
+    reference_close: float | None = None   # last official close to compare with
+
+    @property
+    def change(self) -> float | None:
+        if self.reference_close is None:
+            return None
+        return self.price - self.reference_close
+
+    @property
+    def change_pct(self) -> float | None:
+        if not self.reference_close:
+            return None
+        return (self.price / self.reference_close - 1) * 100
+
+
+def fetch_ticker_info(ticker: str) -> dict:
+    """Yahoo's `.info` dict, or {} on any failure. Never raises."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info if isinstance(info, dict) else {}
+    except Exception:  # noqa: BLE001 - unstable endpoint must never crash the app
+        return {}
+
+
+def _positive(value: object) -> float | None:
+    number = _clean_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _epoch_to_datetime(value: object) -> datetime | None:
+    """Yahoo timestamps are epoch seconds; anything else -> None."""
+    seconds = _positive(value)
+    if seconds is None:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _quote_from_info(info: dict) -> LiveQuote | None:
+    state = str(info.get("marketState") or "").upper()
+    regular = _positive(info.get("regularMarketPrice")) or _positive(
+        info.get("currentPrice")
+    )
+    pre = _positive(info.get("preMarketPrice"))
+    post = _positive(info.get("postMarketPrice"))
+    regular_time = _epoch_to_datetime(info.get("regularMarketTime"))
+
+    if state.startswith("PRE") and state != "PREPRE" and pre is not None:
+        # Pre-market: compare with yesterday's official close.
+        return LiveQuote(
+            pre, SESSION_PRE, _epoch_to_datetime(info.get("preMarketTime")), regular
+        )
+    if state in ("POST", "POSTPOST", "PREPRE", "CLOSED") and post is not None:
+        # After-hours (or overnight): the last extended-hours trade.
+        return LiveQuote(
+            post, SESSION_POST, _epoch_to_datetime(info.get("postMarketTime")), regular
+        )
+    if regular is None:
+        return None
+    if state == "REGULAR":
+        previous = _positive(info.get("regularMarketPreviousClose")) or _positive(
+            info.get("previousClose")
+        )
+        return LiveQuote(regular, SESSION_REGULAR, regular_time, previous)
+    # Closed (or an unknown state) with no extended-hours price: the last
+    # official close is all there is, so there is nothing to compare it with.
+    session = SESSION_UNKNOWN if not state else SESSION_CLOSED
+    return LiveQuote(regular, session, regular_time, None)
+
+
+def _quote_from_minute_bars(ticker: str) -> LiveQuote | None:
+    """Fallback: the last 1-minute bar, extended hours included."""
+    bars = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
+    if not isinstance(bars, pd.DataFrame) or bars.empty or "Close" not in bars.columns:
+        return None
+    closes = bars["Close"].dropna()
+    if closes.empty:
+        return None
+    price = _positive(closes.iloc[-1])
+    if price is None:
+        return None
+    stamp = pd.Timestamp(closes.index[-1])
+    when = stamp.tz_convert("UTC").to_pydatetime() if stamp.tzinfo else None
+    return LiveQuote(price, SESSION_UNKNOWN, when, None)
+
+
+def fetch_live_quote(ticker: str, info: dict | None = None) -> LiveQuote | None:
+    """Latest price from Yahoo, or None if unavailable. Never raises.
+
+    Pass `info` (from fetch_ticker_info) to avoid a second request.
+    """
+    try:
+        if info is None:
+            info = fetch_ticker_info(ticker)
+        quote = _quote_from_info(info) if isinstance(info, dict) else None
+        return quote if quote is not None else _quote_from_minute_bars(ticker)
+    except Exception:  # noqa: BLE001 - a missing quote must never stop the analysis
+        return None
+
+
+def build_live_snapshot(
+    history: pd.DataFrame, now: pd.Timestamp | None = None
+) -> tuple[Snapshot, bool]:
+    """Snapshot that includes today's partial bar while the session is open.
+
+    Returns (snapshot, session_open). While the market trades, SMA_50, RSI_14
+    and ATR_14 are computed on the partial bar, but the volume fields come
+    from the last *completed* session: a partial day's volume is always low
+    and would fake the "calm volume" condition. Outside trading hours this
+    is exactly latest_snapshot() on the full history.
+    """
+    settled, session_open = drop_incomplete_session(history, now)
+    if not session_open:
+        return latest_snapshot(compute_indicators(history)), False
+    live = latest_snapshot(compute_indicators(history))
+    base = latest_snapshot(compute_indicators(settled))
+    snapshot = replace(
+        live,
+        volume=base.volume,
+        volume_sma_20=base.volume_sma_20,
+        partial_session=True,
+    )
+    return snapshot, True
 
 
 # ---------------------------------------------------------------------------
@@ -758,20 +920,22 @@ class EntryCondition:
 @dataclass(frozen=True)
 class EntryPlan:
     conditions: tuple[EntryCondition, ...]
-    falling_knife: bool           # panic day or sharp multi-day slide
+    falling_knife: bool           # panic day, sharp slide or far below SMA_50
     support: float | None         # nearest support level below the close
     limit_price: float            # suggested limit-order reference price
+    far_below_sma: bool = False   # close KNIFE_SMA_DISTANCE or more below SMA_50
 
 
 def _is_panic_day(s: Snapshot) -> bool | None:
     """Sharp one-day drop on unusually heavy volume; None if unknown."""
     if s.prev_close is None or s.atr_14 <= 0:
         return None
-    drop = s.prev_close - s.close
-    return (
-        drop >= KNIFE_DAY_DROP_ATR * s.atr_14
-        and s.volume >= KNIFE_DAY_VOLUME_RATIO * s.volume_sma_20
-    )
+    sharp_drop = s.prev_close - s.close >= KNIFE_DAY_DROP_ATR * s.atr_14
+    if s.partial_session:
+        # Today's volume is not final yet, so the drop alone raises the flag
+        # (deliberately conservative while the session is still open).
+        return sharp_drop
+    return sharp_drop and s.volume >= KNIFE_DAY_VOLUME_RATIO * s.volume_sma_20
 
 
 def _is_sharp_slide(s: Snapshot) -> bool | None:
@@ -779,6 +943,11 @@ def _is_sharp_slide(s: Snapshot) -> bool | None:
     if s.close_slide_ago is None or s.atr_14 <= 0:
         return None
     return s.close_slide_ago - s.close >= KNIFE_SLIDE_ATR * s.atr_14
+
+
+def _is_far_below_sma(s: Snapshot) -> bool:
+    """Close is KNIFE_SMA_DISTANCE (15%) or more below SMA_50."""
+    return s.sma_50 > 0 and s.close <= s.sma_50 * (1 - KNIFE_SMA_DISTANCE)
 
 
 def _negate(value: bool | None) -> bool | None:
@@ -800,6 +969,7 @@ def compute_entry_plan(
     """
     s = snapshot
     panic, slide = _is_panic_day(s), _is_sharp_slide(s)
+    far_below = _is_far_below_sma(s)
     valuation_ok = {
         ValuationTier.ATTRACTIVE: True,
         ValuationTier.FAIR: True,
@@ -818,12 +988,17 @@ def compute_entry_plan(
             _negate(slide),
         ),
         EntryCondition(
+            f"המחיר אינו רחוק מהממוצע: פחות מ-{KNIFE_SMA_DISTANCE:.0%} "
+            "מתחת לממוצע 50",
+            not far_below,
+        ),
+        EntryCondition(
             f"אין דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים",
             _negate(earnings_blocked),
         ),
         EntryCondition("התמחור אינו מנופח והחברה רווחית (לפי PEG)", valuation_ok),
     )
-    falling_knife = panic is True or slide is True
+    falling_knife = panic is True or slide is True or far_below
 
     levels = [lvl for lvl in (s.sma_50, s.low_20) if lvl is not None and lvl < s.close]
     support = max(levels, default=None)
@@ -835,7 +1010,7 @@ def compute_entry_plan(
             limit = max(support, limit)
     if limit <= 0:  # degenerate data: never suggest a non-positive price
         limit = s.close
-    return EntryPlan(conditions, falling_knife, support, round(limit, 2))
+    return EntryPlan(conditions, falling_knife, support, round(limit, 2), far_below)
 
 
 # ---------------------------------------------------------------------------
