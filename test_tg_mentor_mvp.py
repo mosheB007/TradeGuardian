@@ -46,7 +46,8 @@ class FakeTicker:
     """Stand-in for yfinance.Ticker: preset history/calendar, or raising.
 
     Defaults model yfinance's common "no data" answer: no earnings date
-    (calendar None), no valuation data (info None) and no 1-minute bars.
+    (calendar None), no valuation data (info None), no 1-minute bars and no
+    full history (so no per-stock statistics).
     """
 
     def __init__(
@@ -59,6 +60,8 @@ class FakeTicker:
         info_exc=None,
         minute_result=None,
         minute_exc=None,
+        full_result=None,
+        full_exc=None,
     ):
         self._result = history_result
         self._exc = history_exc
@@ -68,12 +71,18 @@ class FakeTicker:
         self._info_exc = info_exc
         self._minute_result = minute_result
         self._minute_exc = minute_exc
+        self._full_result = full_result
+        self._full_exc = full_exc
 
     def history(self, *args, **kwargs):
         if kwargs.get("interval") == "1m":  # live-quote fallback, not the analysis
             if self._minute_exc is not None:
                 raise self._minute_exc
             return self._minute_result
+        if kwargs.get("period") == "max":  # full history for statistics
+            if self._full_exc is not None:
+                raise self._full_exc
+            return self._full_result
         if self._exc is not None:
             raise self._exc
         return self._result
@@ -1569,6 +1578,285 @@ class TestPanicDayOnAPartialSession:
     def test_small_drop_on_a_partial_session_is_not_a_knife(self):
         plan = tg.compute_entry_plan(self.partial(prev_close=112.9, volume=9000.0))
         assert not plan.falling_knife
+
+
+# ---------------------------------------------------------------------------
+# Historical statistics (situation picture, limit ladder, trade odds)
+# ---------------------------------------------------------------------------
+
+def long_ohlcv(closes, volumes=None):
+    """Like make_ohlcv, for histories long enough for statistics."""
+    return make_ohlcv(np.asarray(closes, dtype=float), volumes)
+
+
+FLAT = long_ohlcv([100.0] * 1200)
+RISING = long_ohlcv(100.0 * 1.01 ** np.arange(1200))    # +1% a day
+FALLING = long_ohlcv(1e6 * 0.99 ** np.arange(1200))     # -1% a day
+RNG = np.random.default_rng(7)
+RANDOM_WALK = long_ohlcv(100.0 * np.exp(np.cumsum(RNG.normal(0.0003, 0.015, 2500))))
+
+
+def fill_of(stats, depth):
+    return dict(stats.fill)[depth]
+
+
+class TestHistoryEvents:
+    def test_columns_and_one_row_per_usable_day(self):
+        events = tg.history_events(RANDOM_WALK)
+        assert list(events.columns)[:4] == ["state", "move", "up", "outcome"]
+        assert [c for c in events.columns if c.startswith("fill_")] == [
+            f"fill_{d}" for d in tg.STATS_LIMIT_DEPTHS
+        ]
+        # 49 warm-up days for SMA_50, 5 for the slide test, 30 of future data.
+        assert len(events) == 2500 - 49 - tg.KNIFE_SLIDE_DAYS - tg.STATS_TRADE_DAYS
+        assert set(events["state"]) <= set(tg.STOCK_STATES)
+        assert set(events["outcome"]) <= {"target", "stop", "neither"}
+
+    def test_matches_a_slow_reference_implementation(self):
+        df = tg.compute_indicators(RANDOM_WALK).dropna(
+            subset=["SMA_50", "ATR_14", "Volume_SMA_20"]
+        )
+        events = tg.history_events(RANDOM_WALK)
+        c, a = df["Close"].to_numpy(), df["ATR_14"].to_numpy()
+        lo, hi = df["Low"].to_numpy(), df["High"].to_numpy()
+        for row in (0, 137, 900, len(events) - 1):
+            i = df.index.get_loc(events.index[row])
+            e = events.iloc[row]
+            assert e["move"] == pytest.approx((c[i + 10] - c[i]) / a[i])
+            assert e["up"] == (c[i + 20] > c[i])
+            for d in tg.STATS_LIMIT_DEPTHS:
+                assert e[f"fill_{d}"] == (lo[i + 1:i + 11].min() <= c[i] - d * a[i])
+            stop, target = c[i] - 2 * a[i], c[i] + 4 * a[i]
+            expected = "neither"
+            for j in range(i + 1, i + 31):
+                if lo[j] <= stop:
+                    expected = "stop"; break
+                if hi[j] >= target:
+                    expected = "target"; break
+            assert e["outcome"] == expected
+
+    def test_too_short_history_gives_no_events(self):
+        assert tg.history_events(make_ohlcv([100.0] * 80)).empty
+
+    def test_garbage_gives_no_events(self):
+        assert tg.history_events(pd.DataFrame({"x": [1, 2]})).empty
+
+
+class TestComputeHistoryStats:
+    def test_flat_price(self):
+        stats = tg.compute_history_stats(FLAT)
+        assert stats.range_atr == pytest.approx((0, 0, 0, 0, 0))
+        assert stats.up_rate == 0.0
+        # Lows sit 1% under the close and ATR is 2% of it: exactly 0.5 ATR.
+        assert fill_of(stats, 0.5) == 1.0 and fill_of(stats, 1.0) == 0.0
+        below = stats.odds_for(tg.STATE_BELOW)   # close == SMA_50 is "not above"
+        assert (below.target, below.stop, below.neither) == (0.0, 0.0, 1.0)
+        assert stats.odds_for(tg.STATE_ABOVE) is None
+
+    def test_steady_rise(self):
+        stats = tg.compute_history_stats(RISING)
+        assert stats.up_rate == 1.0
+        assert all(q > 4 for q in stats.range_atr)         # ~+10% in 10 days
+        assert all(p == 0.0 for _, p in stats.fill)        # it never comes back
+        above = stats.odds_for(tg.STATE_ABOVE)
+        assert (above.target, above.stop) == (1.0, 0.0)
+        assert above.days == stats.days
+
+    def test_steady_fall(self):
+        stats = tg.compute_history_stats(FALLING)
+        assert stats.up_rate == 0.0
+        assert all(q < -4 for q in stats.range_atr)
+        assert all(p == 1.0 for _, p in stats.fill)
+        knife = stats.odds_for(tg.STATE_KNIFE)             # far below SMA_50
+        assert (knife.target, knife.stop) == (0.0, 1.0)
+
+    def test_random_walk_is_internally_consistent(self):
+        stats = tg.compute_history_stats(RANDOM_WALK)
+        assert stats.days == 2416 and stats.years == pytest.approx(2416 / 252)
+        assert list(stats.range_atr) == sorted(stats.range_atr)
+        probs = [p for _, p in stats.fill]
+        assert probs == sorted(probs, reverse=True)        # deeper fills less often
+        assert all(0 <= p <= 1 for p in probs)
+        for state in tg.STOCK_STATES:
+            odds = stats.odds_for(state)
+            if odds is not None:
+                assert odds.target + odds.stop + odds.neither == pytest.approx(1.0)
+                assert odds.days >= tg.STATS_MIN_STATE_DAYS
+        assert sum(o.days for _, o in stats.odds if o) <= stats.days
+
+    def test_below_three_years_there_are_no_statistics(self):
+        days = tg.STATS_MIN_DAYS + 49 + tg.KNIFE_SLIDE_DAYS + tg.STATS_TRADE_DAYS
+        assert tg.compute_history_stats(long_ohlcv([100.0] * days)) is not None
+        assert tg.compute_history_stats(long_ohlcv([100.0] * (days - 1))) is None
+
+    def test_rare_state_reports_no_odds(self):
+        stats = tg.compute_history_stats(RISING)
+        assert stats.odds_for(tg.STATE_KNIFE) is None
+        assert stats.odds_for("nonsense") is None
+
+    @pytest.mark.parametrize("bad", [None, "x", 42, pd.DataFrame(), pd.DataFrame({"a": [1]})])
+    def test_unusable_input_is_none(self, bad):
+        assert tg.compute_history_stats(bad) is None
+
+    def test_degenerate_zero_range_data_does_not_crash(self):
+        df = long_ohlcv([100.0] * 1200)
+        df["High"] = df["Low"] = df["Close"]               # no range at all
+        stats = tg.compute_history_stats(df)               # must not raise
+        assert stats is None or isinstance(stats, tg.HistoryStats)
+
+
+class TestFetchFullHistory:
+    def test_requests_the_maximum_period(self, monkeypatch):
+        captured = {}
+
+        class SpyTicker(FakeTicker):
+            def history(self, *args, **kwargs):
+                captured.update(kwargs)
+                return FLAT
+
+        monkeypatch.setattr(tg.yf, "Ticker", lambda symbol: SpyTicker())
+        assert tg.fetch_full_history("NVDA") is FLAT
+        assert captured == {"period": "max", "interval": "1d"}
+
+    @pytest.mark.parametrize("result", [None, pd.DataFrame(), "garbage"])
+    def test_empty_or_odd_results_are_none(self, monkeypatch, result):
+        patch_ticker(monkeypatch, full_result=result)
+        assert tg.fetch_full_history("NVDA") is None
+
+    def test_errors_are_none(self, monkeypatch):
+        patch_ticker(monkeypatch, full_exc=RuntimeError("Yahoo flaked"))
+        assert tg.fetch_full_history("NVDA") is None
+
+    def test_the_six_month_frame_is_not_the_full_history(self, monkeypatch):
+        patch_ticker(monkeypatch, history_result=make_ohlcv([100.0] * 120))
+        assert tg.fetch_full_history("NVDA") is None
+
+
+class TestReferenceStats:
+    R = tg.REFERENCE_STATS
+
+    def test_shape_matches_the_live_statistics(self):
+        assert len(self.R.range_atr) == len(tg.STATS_RANGE_QUANTILES)
+        assert tuple(d for d, _ in self.R.fill) == tg.STATS_LIMIT_DEPTHS
+        assert tuple(s for s, _ in self.R.odds) == tg.STOCK_STATES
+
+    def test_values_are_coherent(self):
+        assert list(self.R.range_atr) == sorted(self.R.range_atr)
+        probs = [p for _, p in self.R.fill]
+        assert probs == sorted(probs, reverse=True)
+        for _, odds in self.R.odds:
+            assert odds.target + odds.stop + odds.neither == pytest.approx(1.0, abs=0.002)
+        assert 0.5 < self.R.up_rate < 0.65
+        assert sum(o.days for _, o in self.R.odds) == self.R.days
+
+
+class TestExpectedRange:
+    def test_scales_quantiles_by_atr(self):
+        s = snap(close=100.0, atr=2.0)
+        r = tg.expected_range(s, tg.REFERENCE_STATS)
+        q = tg.REFERENCE_STATS.range_atr
+        assert (r.low_80, r.low_50, r.median, r.high_50, r.high_80) == pytest.approx(
+            tuple(100.0 + 2.0 * x for x in q)
+        )
+        assert r.low_80 < r.low_50 < r.median < r.high_50 < r.high_80
+
+    def test_never_goes_below_zero(self):
+        r = tg.expected_range(snap(close=3.0, atr=2.0), tg.REFERENCE_STATS)
+        assert r.low_80 == 0.0
+
+    def test_zero_atr_collapses_to_the_close(self):
+        r = tg.expected_range(snap(close=50.0, atr=0.0), tg.REFERENCE_STATS)
+        assert r.low_80 == r.high_80 == 50.0
+
+
+class TestLimitFillProbability:
+    R = tg.REFERENCE_STATS
+
+    @pytest.mark.parametrize("depth", [0.0, -1.0])
+    def test_at_or_above_the_close_always_fills(self, depth):
+        assert tg.limit_fill_probability(self.R, depth) == 1.0
+
+    @pytest.mark.parametrize("depth", tg.STATS_LIMIT_DEPTHS)
+    def test_measured_depths_are_returned_exactly(self, depth):
+        assert tg.limit_fill_probability(self.R, depth) == pytest.approx(
+            fill_of(self.R, depth)
+        )
+
+    def test_interpolates_between_measured_depths(self):
+        halfway = (fill_of(self.R, 1.0) + fill_of(self.R, 1.5)) / 2
+        assert tg.limit_fill_probability(self.R, 1.25) == pytest.approx(halfway)
+        assert tg.limit_fill_probability(self.R, 0.25) == pytest.approx(
+            (1.0 + fill_of(self.R, 0.5)) / 2
+        )
+        assert tg.limit_fill_probability(self.R, 3.5) == pytest.approx(
+            (fill_of(self.R, 3.0) + fill_of(self.R, 4.0)) / 2
+        )
+
+    def test_beyond_the_deepest_depth_stays_at_the_last_value(self):
+        assert tg.limit_fill_probability(self.R, 9.0) == fill_of(self.R, 4.0)
+
+    def test_is_monotonic(self):
+        values = [tg.limit_fill_probability(self.R, d / 10) for d in range(0, 60)]
+        assert values == sorted(values, reverse=True)
+
+
+class TestLimitLadder:
+    def test_steps_prices_and_distances(self):
+        ladder = tg.limit_ladder(snap(close=100.0, atr=2.0))
+        assert [s.depth_atr for s in ladder] == list(tg.LADDER_DEPTHS)
+        assert [s.price for s in ladder] == [99.0, 98.0, 97.0, 96.0, 94.0]
+        assert [s.pct_below for s in ladder] == pytest.approx([1, 2, 3, 4, 6])
+
+    def test_non_positive_prices_are_dropped(self):
+        ladder = tg.limit_ladder(snap(close=3.0, atr=2.0))
+        assert [s.price for s in ladder] == [2.0, 1.0]
+
+    def test_prices_are_rounded_to_cents(self):
+        assert tg.limit_ladder(snap(close=100.0, atr=1.23456))[0].price == 99.38
+
+
+class TestSituationHelpers:
+    def test_stock_state(self):
+        assert tg.stock_state(snap(close=110, sma_50=100), False) == tg.STATE_ABOVE
+        assert tg.stock_state(snap(close=90, sma_50=100), False) == tg.STATE_BELOW
+        assert tg.stock_state(snap(close=110, sma_50=100), True) == tg.STATE_KNIFE
+
+    @pytest.mark.parametrize(
+        "value, zone",
+        [(10, "oversold"), (29.9, "oversold"), (30, "weak"), (44.9, "weak"),
+         (45, "firm"), (70, "firm"), (70.1, "overbought"), (95, "overbought")],
+    )
+    def test_rsi_zone_boundaries(self, value, zone):
+        assert tg.rsi_zone(value) == zone
+
+    def test_snapshot_trend_slope_and_atr_percent(self):
+        df = tg.compute_indicators(make_ohlcv(np.linspace(100, 150, 120)))
+        s = tg.latest_snapshot(df)
+        assert s.sma_50_prev == pytest.approx(df["SMA_50"].iloc[-21])
+        assert s.sma_rising is True
+        assert s.atr_pct == pytest.approx(s.atr_14 / s.close * 100)
+        down = tg.latest_snapshot(tg.compute_indicators(make_ohlcv(np.linspace(150, 100, 120))))
+        assert down.sma_rising is False
+
+    def test_unknown_slope_is_none(self):
+        assert snap().sma_rising is None
+        short = tg.latest_snapshot(
+            tg.compute_indicators(make_ohlcv(np.linspace(100, 110, 60)))
+        )
+        assert short.sma_rising is None  # SMA_50 did not exist 20 sessions ago
+
+    def test_zero_close_has_no_atr_percent(self):
+        assert snap(close=0.0).atr_pct == 0.0
+
+    def test_market_regime(self):
+        up = tg.market_regime(make_ohlcv(np.linspace(100, 150, 120)))
+        assert up.above is True and up.rising is True and up.close == pytest.approx(150)
+        down = tg.market_regime(make_ohlcv(np.linspace(150, 100, 120)))
+        assert down.above is False and down.rising is False
+
+    @pytest.mark.parametrize("bad", [None, pd.DataFrame(), make_ohlcv([100.0] * 20)])
+    def test_market_regime_unusable_input_is_none(self, bad):
+        assert tg.market_regime(bad) is None
 
 
 # ---------------------------------------------------------------------------

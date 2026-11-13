@@ -42,6 +42,14 @@ EARNINGS_REMINDER = (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def fresh_cache():
+    """The app caches statistics and the market regime across reruns."""
+    import streamlit as st
+
+    st.cache_data.clear()
+
+
+@pytest.fixture(autouse=True)
 def offline_news(monkeypatch):
     """By default the RSS download fails (no network in tests)."""
     def fail(url):
@@ -275,6 +283,7 @@ class TestLevels:
         titles = [str(s.value) for s in at.subheader]
         assert titles == [
             "דוח לימודי טכני: NVDA",
+            "תמונת מצב",
             "בדיקת תמחור וערך (האם המניה יקרה?)",
             "חדשות ואזהרות",
             "תכנון כניסה (רמות מחיר והוראת Limit)",
@@ -1153,6 +1162,228 @@ class TestOpenSession:
     def test_closed_session_shows_no_open_note(self, monkeypatch):
         patch_market(monkeypatch, history_result=make_ohlcv(UPTREND))
         assert OPEN_SESSION_NOTE not in page_text(run_check())
+
+
+# ---------------------------------------------------------------------------
+# Situation picture (historical statistics, limit ladder, trade odds)
+# ---------------------------------------------------------------------------
+
+SITUATION_TITLE = "תמונת מצב"
+NO_STOCK_STATS = "אין מספיק היסטוריה"
+REF_COLUMN = "סל ייחוס (55 מניות)"
+NO_DIRECTION = "**הכלי אינו חוזה כיוון.**"
+LEVEL_NOTE = "הסיווג הוא כלל משמעת לימודי, לא תחזית"
+RNG = np.random.default_rng(11)
+LONG_HISTORY = make_ohlcv(100.0 * np.exp(np.cumsum(RNG.normal(0.0003, 0.015, 2500))))
+
+
+def share(value):
+    return f"{value * 100:.0f}%"
+
+
+def table(at, heading):
+    """The markdown block (a table with its bold heading) containing `heading`."""
+    return next(str(m.value) for m in at.markdown if heading in str(m.value))
+
+
+class TestSituationPicture:
+    def check(self, monkeypatch, closes=GREEN_CLOSES, volumes=GREEN_VOLUMES,
+              full=LONG_HISTORY, **kwargs):
+        self.df = make_ohlcv(closes, volumes)
+        patch_market(monkeypatch, history_result=self.df, full_result=full, **kwargs)
+        self.stats = tg.compute_history_stats(full)
+        return run_check()
+
+    def test_section_order(self, monkeypatch):
+        at = self.check(monkeypatch)
+        titles = [str(s.value) for s in at.subheader]
+        assert (
+            titles.index("דוח לימודי טכני: NVDA")
+            < titles.index(SITUATION_TITLE)
+            < titles.index(VALUATION_TITLE)
+        )
+
+    def test_describes_trend_momentum_volatility_and_market(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        text = table(at, "**מגמה:**")
+        assert "**מגמה:** המחיר מעל ממוצע 50, והממוצע עצמו עולה." in text
+        assert f"**מומנטום:** RSI {snap.rsi_14:.0f} - חלש (30 עד 45)." in text
+        assert f"תנועה יומית ממוצעת של {snap.atr_pct:.1f}% מהמחיר (ATR)" in text
+        # The fake market serves the same frame for SPY: above a rising SMA_50.
+        assert "**מצב השוק:** S&P 500 מעל ממוצע 50 שלו, והממוצע עצמו עולה." in text
+
+    def test_downtrend_wording(self, monkeypatch):
+        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
+        text = table(at, "**מגמה:**")
+        assert "המחיר מתחת לממוצע 50, והממוצע עצמו יורד." in text
+        assert "S&P 500 מתחת לממוצע 50 שלו, והממוצע עצמו יורד." in text
+        assert "מכירת יתר (מתחת ל-30)" in text
+
+    def test_range_table_shows_the_stock_beside_the_reference(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        own = tg.expected_range(snap, self.stats)
+        ref = tg.expected_range(snap, tg.REFERENCE_STATS)
+        text = table(at, "טווח המחיר ב-10 ימי המסחר הקרובים")
+        assert f"| | המניה הזו ({self.stats.years:.0f} שנים) | {REF_COLUMN} |" in text
+        assert (
+            f"| בחצי מהמקרים | {own.low_50:,.2f} עד {own.high_50:,.2f} "
+            f"| {ref.low_50:,.2f} עד {ref.high_50:,.2f} |"
+        ) in text
+        assert (
+            f"| ב-80% מהמקרים | {own.low_80:,.2f} עד {own.high_80:,.2f} "
+            f"| {ref.low_80:,.2f} עד {ref.high_80:,.2f} |"
+        ) in text
+        assert own.low_80 < snap.close < own.high_80
+
+    def test_direction_statement_with_both_rates(self, monkeypatch):
+        at = self.check(monkeypatch)
+        info = next(str(i.value) for i in at.info if NO_DIRECTION in str(i.value))
+        assert "57% מהימים הסתיימו במחיר גבוה יותר אחרי 20 ימי מסחר" in info
+        assert f"במניה הזו: {share(self.stats.up_rate)}." in info
+        assert "לא תחזית" in info
+
+    def test_level_note_says_it_is_not_a_forecast(self, monkeypatch):
+        assert LEVEL_NOTE in text_of(self.check(monkeypatch).caption)
+
+    def test_young_stock_shows_the_reference_only(self, monkeypatch):
+        at = self.check(monkeypatch, full=make_ohlcv(np.linspace(100, 150, 400)))
+        assert self.stats is None
+        text = table(at, "טווח המחיר ב-10 ימי המסחר הקרובים")
+        assert f"| | המניה הזו | {REF_COLUMN} |" in text
+        assert f"| בחצי מהמקרים | {NO_STOCK_STATS} |" in text
+        info = next(str(i.value) for i in at.info if NO_DIRECTION in str(i.value))
+        assert "במניה הזו" not in info
+        assert NO_STOCK_STATS in table(at, "סולם Limit")
+        assert NO_STOCK_STATS in table(at, "מה קרה בעבר לעסקה כזו")
+
+    def test_history_failure_falls_back_to_the_reference(self, monkeypatch):
+        at = self.check(monkeypatch, full=None, full_exc=RuntimeError("Yahoo flaked"))
+        assert not at.exception
+        assert NO_STOCK_STATS in table(at, "טווח המחיר ב-10 ימי המסחר הקרובים")
+        assert {"approve", "veto"} <= button_keys(at)
+
+    def test_market_regime_failure_is_reported_not_fatal(self, monkeypatch):
+        real = tg.fetch_price_history
+
+        def no_spy(ticker):
+            if ticker == "SPY":
+                raise tg.DataFetchError("down")
+            return real(ticker)
+
+        monkeypatch.setattr(tg, "fetch_price_history", no_spy)
+        at = self.check(monkeypatch)
+        assert not at.exception
+        assert "**מצב השוק:** לא זמין כרגע." in table(at, "**מגמה:**")
+        assert SITUATION_TITLE in text_of(at.subheader)
+
+    def test_statistics_are_downloaded_once_per_ticker(self, monkeypatch):
+        calls = []
+
+        class CountingTicker(FakeTicker):
+            def history(self, *args, **kwargs):
+                if kwargs.get("period") == "max":
+                    calls.append(1)
+                return super().history(*args, **kwargs)
+
+        df = make_ohlcv(GREEN_CLOSES, GREEN_VOLUMES)
+        monkeypatch.setattr(tg.yf, "Ticker", lambda symbol: CountingTicker(
+            history_result=df, full_result=LONG_HISTORY))
+        at = run_check()
+        at.button(key="refresh").click()
+        at.run()
+        at.button(key="check").click()
+        at.run()
+        assert not at.exception
+        assert len(calls) == 1  # cached across refresh and re-check
+
+    # --- limit ladder ---
+
+    def test_ladder_lists_prices_and_both_fill_rates(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        text = table(at, "סולם Limit")
+        ladder = tg.limit_ladder(snap)
+        assert len(ladder) == 5
+        for step in ladder:
+            own = share(tg.limit_fill_probability(self.stats, step.depth_atr))
+            ref = share(tg.limit_fill_probability(tg.REFERENCE_STATS, step.depth_atr))
+            assert f"| {step.price:,.2f} | {step.pct_below:.1f}% | {own} | {ref} |" in text
+        assert "| מחיר Limit | מרחק | המניה הזו | סל ייחוס |" in text
+        assert "| 77% |" in text and "| 16% |" in text  # reference: 0.5 and 3 ATR
+        assert "המדרגות הן 0.5, 1, 1.5, 2, 3 ATR מתחת לסגירה" in text_of(at.caption)
+        assert "המתנה לירידה לא שיפרה את סיכויי העסקה" in text_of(at.caption)
+
+    def test_fill_chance_of_the_planned_price(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, plan = expected_entry(self.df)
+        depth = (snap.close - plan.limit_price) / snap.atr_14
+        own = share(tg.limit_fill_probability(self.stats, depth))
+        ref = share(tg.limit_fill_probability(tg.REFERENCE_STATS, depth))
+        assert (
+            f"הוראת Limit במרחק כזה מהמחיר ({depth:.1f} ATR) התמלאה בעבר תוך "
+            f"10 ימי מסחר ב-{own} מהמקרים במניה הזו, {ref} מהמקרים בסל הייחוס."
+        ) in text_of(at.caption)
+
+    def test_fill_chance_follows_the_entry_field(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        deep = round(snap.close - 3 * snap.atr_14, 2)
+        entry_input(at).set_value(deep)
+        at.run()
+        depth = (snap.close - deep) / snap.atr_14
+        ref = share(tg.limit_fill_probability(tg.REFERENCE_STATS, depth))
+        assert f"({depth:.1f} ATR)" in text_of(at.caption)
+        assert f"{ref} מהמקרים בסל הייחוס" in text_of(at.caption)
+
+    def test_entry_at_or_above_the_close_fills_immediately(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        entry_input(at).set_value(round(snap.close + 1, 2))
+        at.run()
+        captions = text_of(at.caption)
+        assert "צפויה להתבצע מיד" in captions
+        assert "התמלאה בעבר תוך" not in captions
+
+    # --- trade odds ---
+
+    @pytest.mark.parametrize(
+        "closes, volumes, state, label",
+        [
+            (GREEN_CLOSES, GREEN_VOLUMES, "above", "מעל ממוצע 50"),
+            (MILD_DOWNTREND, None, "below", "מתחת לממוצע 50"),
+            (DOWNTREND, None, "knife", "סכין נופלת"),
+        ],
+    )
+    def test_odds_table_matches_the_stock_state(
+        self, monkeypatch, closes, volumes, state, label
+    ):
+        at = self.check(monkeypatch, closes=closes, volumes=volumes)
+        text = table(at, "מה קרה בעבר לעסקה כזו")
+        assert f'במצב "{label}"' in text
+        ref = tg.REFERENCE_STATS.odds_for(state)
+        own = self.stats.odds_for(state)
+        own_cells = (
+            [NO_STOCK_STATS] * 3 if own is None
+            else [share(own.target), share(own.stop), share(own.neither)]
+        )
+        assert f"| היעד הושג | {own_cells[0]} | {share(ref.target)} |" in text
+        assert f"| הסטופ הופעל | {own_cells[1]} | {share(ref.stop)} |" in text
+        assert f"| אף אחד מהם | {own_cells[2]} | {share(ref.neither)} |" in text
+
+    def test_odds_caption_states_assumptions_and_the_bear_market_caveat(
+        self, monkeypatch
+    ):
+        captions = text_of(self.check(monkeypatch).caption)
+        assert "סטופ 2×ATR ויעד 1:2, עד 30 ימי מסחר, בלי עמלות" in captions
+        assert "ב-2000-2002 וב-2008-2009 היעד הושג רק בין 16% ל-25%" in captions
+
+    def test_no_recommendation_wording_anywhere(self, monkeypatch):
+        text = page_text(self.check(monkeypatch))
+        for phrase in ("כדאי לקנות", "מומלץ לקנות", "צפוי לעלות", "צפוי לרדת",
+                       "איתות קנייה"):
+            assert phrase not in text
 
 
 # ---------------------------------------------------------------------------
