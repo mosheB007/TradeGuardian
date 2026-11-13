@@ -9,14 +9,16 @@ earnings blackout, RSS news and the capital shield - is imported unchanged
 from tg_mentor_mvp.py, so the CLI, the GUI and the test-suite share one
 implementation. This file only contains presentation and UI state.
 
-Flow (same as the CLI):
+Flow (as in the CLI, except that the GUI also lists headlines for RED stocks):
     1. Fetch prices. Earnings due today..+14 days -> red warning block,
        then the flow continues for learning purposes only.
        (Earnings date unknown -> yellow warning, continue.)
     2. Technical report + level box (success / warning / error), then an
        educational valuation section (P/E, Forward P/E, PEG) that never
-       affects the level. RED -> stop.
-    3. GREEN/YELLOW: headlines + "approve" / "disqualify" buttons.
+       affects the level.
+    3. Headlines, for every level.
+    4. RED -> a note that the capital shield is not calculated; stop.
+       GREEN/YELLOW: "approve" / "disqualify" buttons.
        Approve -> capital shield (plus a red earnings reminder when a
        report is due within the blackout window).
        Disqualify -> red veto message.
@@ -113,6 +115,10 @@ DISCLAIMER = (
 
 APPROVE, VETO = "approve", "veto"
 
+RED_NO_RISK_PLAN_MESSAGE = (
+    "[אדום] מניה במגמה שלילית (מתחת לממוצע 50) – "
+    "מגן ההון אינו מחושב עבור מניות אדומות."
+)
 EARNINGS_RISK_REMINDER = (
     f"תזכורת קריטית: קיים דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים. "
     "קו ההגנה (Stop-Loss) אינו מגן מפני פער מחירים (Gap) לאחר פרסום הדוח."
@@ -155,7 +161,7 @@ def run_analysis(raw_ticker: str) -> Analysis:
     # the full analysis is always computed.
     snapshot = latest_snapshot(compute_indicators(history))
     level = classify(snapshot)
-    news = tuple(fetch_news(ticker)) if level is not Level.RED else ()
+    news = tuple(fetch_news(ticker))  # shown for every level, RED included
     valuation = fetch_valuation(ticker)  # best-effort, never raises
     return Analysis(
         ticker, today, session_open, earnings, snapshot, level, news, valuation
@@ -531,11 +537,13 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     render_chart_link(a.ticker)
     st.divider()
     render_valuation(a.valuation)  # shown for every level, RED included
-    if a.level is Level.RED:
-        return
-
     st.divider()
-    render_news(a.ticker, a.news)
+    render_news(a.ticker, a.news)  # shown for every level, RED included
+
+    # The veto step and the capital shield are for GREEN/YELLOW only.
+    if a.level is Level.RED:
+        st.info(RED_NO_RISK_PLAN_MESSAGE, icon="🛑")
+        return
     decision = st.session_state.get("decision")
     if decision == APPROVE:
         st.divider()

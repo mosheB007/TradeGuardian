@@ -25,6 +25,10 @@ GREEN_VOLUMES = np.r_[np.full(119, 1_000_000.0), 500_000.0]
 
 RISK_TITLE = "מגן הון (ניהול סיכונים לעסקה מדומה)"
 DISCLAIMER = "אינה מספקת איתותי מסחר"
+RED_NO_RISK_PLAN = (
+    "[אדום] מניה במגמה שלילית (מתחת לממוצע 50) – "
+    "מגן ההון אינו מחושב עבור מניות אדומות."
+)
 EARNINGS_CONTINUES = "הניתוח ממשיך לצורכי לימוד בלבד - שים לב לסיכון הגבוה לפני דוח כספי."
 EARNINGS_REMINDER = (
     "תזכורת קריטית: קיים דוח כספי ב-14 הימים הקרובים. "
@@ -246,15 +250,60 @@ class TestLevels:
         assert "דורשת זהירות" in text_of(at.warning)
         assert "RSI" in text_of(at.warning)
 
-    def test_red_uses_error_box_and_stops(self, monkeypatch):
+    def test_red_uses_error_box_shows_news_but_no_capital_shield(self, monkeypatch):
         patch_market(monkeypatch, history_result=make_ohlcv(DOWNTREND))
-        calls = patch_news(monkeypatch, rss_xml(rss_item("Irrelevant")))
+        calls = patch_news(
+            monkeypatch, rss_xml(rss_item("Red stock headline", "https://news.io/r"))
+        )
         at = run_check()
         assert "נפסלת" in text_of(at.error)
         assert "על הגדר" in text_of(at.error)
+        # News is fetched and listed for a RED stock too...
+        assert len(calls) == 1
+        text = page_text(at)
+        assert "חדשות ואזהרות" in text_of(at.subheader)
+        assert "Red stock headline" in text and "https://news.io/r" in text
+        # ...but the veto step and the capital shield are not offered.
+        assert RED_NO_RISK_PLAN in [str(e.value) for e in at.info]
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
-        assert calls == []  # no news for a disqualified stock
+        assert RISK_TITLE not in text
+
+    def test_red_page_order_is_valuation_news_then_no_shield_note(self, monkeypatch):
+        patch_market(monkeypatch, history_result=make_ohlcv(DOWNTREND))
+        at = run_check()
+        titles = [str(s.value) for s in at.subheader]
+        assert titles == [
+            "דוח לימודי טכני: NVDA",
+            "בדיקת תמחור וערך (האם המניה יקרה?)",
+            "חדשות ואזהרות",
+        ]
+
+    def test_red_without_headlines_shows_manual_check(self, monkeypatch):
+        patch_market(monkeypatch, history_result=make_ohlcv(DOWNTREND))
+        at = run_check()  # autouse fixture: RSS fails
+        assert "לא נמצאו כותרות" in text_of(at.warning)
+        assert RED_NO_RISK_PLAN in text_of(at.info)
+
+    def test_red_ignores_a_stale_approve_decision(self, monkeypatch):
+        # Defensive: even if session state says "approve", RED gets no shield.
+        patch_market(monkeypatch, history_result=make_ohlcv(DOWNTREND))
+        at = run_check()
+        at.session_state["decision"] = "approve"
+        at.run()
+        assert not at.exception
         assert RISK_TITLE not in page_text(at)
+        assert RED_NO_RISK_PLAN in text_of(at.info)
+
+    @pytest.mark.parametrize(
+        "closes, volumes", [(GREEN_CLOSES, GREEN_VOLUMES), (UPTREND, None)]
+    )
+    def test_green_and_yellow_do_not_show_the_red_note(
+        self, monkeypatch, closes, volumes
+    ):
+        patch_market(monkeypatch, history_result=make_ohlcv(closes, volumes))
+        at = run_check()
+        assert RED_NO_RISK_PLAN not in page_text(at)
+        assert {"approve", "veto"} <= button_keys(at)
 
     def close_metric(self, at):
         return next(m for m in at.metric if m.label == "מחיר סגירה אחרון")
@@ -373,15 +422,21 @@ class TestEarnings:
         assert RISK_TITLE not in page_text(at)
         assert EARNINGS_REMINDER not in page_text(at)
 
-    def test_close_earnings_red_stock_shows_report_but_no_news(self, monkeypatch):
+    def test_close_earnings_red_stock_shows_report_and_news_but_no_shield(
+        self, monkeypatch
+    ):
         self.patch_close_earnings(monkeypatch, closes=DOWNTREND)
-        calls = patch_news(monkeypatch, rss_xml(rss_item("Irrelevant")))
+        calls = patch_news(monkeypatch, rss_xml(rss_item("Red stock headline")))
         at = run_check()
         assert EARNINGS_CONTINUES in text_of(at.error)
         assert "דוח לימודי טכני: NVDA" in page_text(at)
         assert "על הגדר" in text_of(at.error)
+        assert len(calls) == 1
+        assert "Red stock headline" in page_text(at)
+        assert RED_NO_RISK_PLAN in text_of(at.info)
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
-        assert calls == []
+        assert RISK_TITLE not in page_text(at)
+        assert EARNINGS_REMINDER not in page_text(at)
 
     def test_no_reminder_in_risk_plan_when_earnings_are_far(self, monkeypatch):
         self.patch_close_earnings(monkeypatch, days=40)
@@ -546,9 +601,9 @@ class TestValuation:
         assert VALUATION_TITLE in text_of(at.subheader)
         assert self.metric(at, PEG_LABEL).value == "0.60"
         assert "**תמחור: מחיר טוב / אטרקטיבי" in text_of(at.success)
-        # ...and the flow still stops after it.
+        # ...and it does not unlock the veto step or the capital shield.
         assert {"approve", "veto"}.isdisjoint(button_keys(at))
-        assert "חדשות ואזהרות" not in text_of(at.subheader)
+        assert RED_NO_RISK_PLAN in text_of(at.info)
 
     def test_valuation_sits_between_report_and_news(self, monkeypatch):
         at = self.check(monkeypatch, FULL_INFO)
