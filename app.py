@@ -50,7 +50,22 @@ from tg_mentor_mvp import (
     ENTRY_PULLBACK_ATR,
     KNIFE_SMA_DISTANCE,
     EntryPlan,
+    HistoryStats,
+    LADDER_DEPTHS,
     LiveQuote,
+    MarketRegime,
+    REFERENCE_SPAN,
+    REFERENCE_STATS,
+    REFERENCE_TICKERS,
+    BEAR_TARGET_RANGE,
+    STATE_ABOVE,
+    STATE_BELOW,
+    STATE_KNIFE,
+    STATS_FILL_DAYS,
+    STATS_RANGE_DAYS,
+    STATS_TRADE_DAYS,
+    STATS_UP_DAYS,
+    TradeOdds,
     SESSION_CLOSED,
     SESSION_POST,
     SESSION_PRE,
@@ -72,6 +87,14 @@ from tg_mentor_mvp import (
     ValuationTier,
     classify,
     compute_entry_plan,
+    compute_history_stats,
+    expected_range,
+    fetch_full_history,
+    limit_fill_probability,
+    limit_ladder,
+    market_regime,
+    rsi_zone,
+    stock_state,
     compute_indicators,
     compute_risk_plan,
     build_live_snapshot,
@@ -134,6 +157,7 @@ DISCLAIMER = (
 )
 
 APPROVE, VETO = "approve", "veto"
+MARKET_TICKER = "SPY"  # S&P 500 ETF, used as the "market" in the situation picture
 
 RED_NO_RISK_PLAN_MESSAGE = (
     "[אדום] מניה במגמה שלילית (מתחת לממוצע 50) – "
@@ -163,6 +187,8 @@ class Analysis:
     valuation: Valuation = Valuation()  # educational; never affects `level`
     entry_plan: EntryPlan | None = None  # always set by run_analysis
     live_quote: LiveQuote | None = None  # None when Yahoo gives no price
+    stats: HistoryStats | None = None    # the stock's own history; may be None
+    market: MarketRegime | None = None   # S&P 500 regime; may be None
 
     @property
     def earnings_blocked(self) -> bool:
@@ -197,6 +223,8 @@ def run_analysis(raw_ticker: str) -> Analysis:
     return Analysis(
         ticker, today, session_open, earnings, snapshot, level, news, valuation,
         entry_plan, live_quote,
+        load_history_stats(ticker),  # best-effort, cached for a day
+        load_market_regime(),        # best-effort, cached for 15 minutes
     )
 
 
@@ -553,6 +581,194 @@ def render_risk(plan: RiskPlan, earnings_blocked: bool = False) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Situation picture - historical statistics (never a forecast or a signal)
+# ---------------------------------------------------------------------------
+
+SITUATION_TITLE = "תמונת מצב"
+NO_STOCK_STATS = "אין מספיק היסטוריה"
+REFERENCE_COLUMN = f"סל ייחוס ({REFERENCE_TICKERS} מניות)"
+_STATE_LABEL = {
+    STATE_ABOVE: "מעל ממוצע 50",
+    STATE_BELOW: "מתחת לממוצע 50",
+    STATE_KNIFE: "סכין נופלת",
+}
+_RSI_ZONE_LABEL = {
+    "oversold": "מכירת יתר (מתחת ל-30)",
+    "weak": "חלש (30 עד 45)",
+    "firm": "חיובי (45 עד 70)",
+    "overbought": "קניית יתר (מעל 70)",
+}
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def _cached_history_stats(ticker: str) -> HistoryStats:
+    stats = compute_history_stats(fetch_full_history(ticker))
+    if stats is None:
+        raise LookupError(ticker)  # exceptions are not cached: retried next time
+    return stats
+
+
+def load_history_stats(ticker: str) -> HistoryStats | None:
+    """The stock's own statistics (cached for a day); None if unavailable."""
+    try:
+        return _cached_history_stats(ticker)
+    except Exception:  # noqa: BLE001 - optional context, never fatal
+        return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_market_regime() -> MarketRegime:
+    regime = market_regime(fetch_price_history(MARKET_TICKER))
+    if regime is None:
+        raise LookupError(MARKET_TICKER)
+    return regime
+
+
+def load_market_regime() -> MarketRegime | None:
+    """S&P 500 regime (cached for 15 minutes); None if unavailable."""
+    try:
+        return _cached_market_regime()
+    except Exception:  # noqa: BLE001 - optional context, never fatal
+        return None
+
+
+def _share(value: float) -> str:
+    return f"{value * 100:.0f}%"
+
+
+def _stock_column(stats: HistoryStats | None) -> str:
+    if stats is None:
+        return "המניה הזו"
+    return f"המניה הזו ({stats.years:.0f} שנים)"
+
+
+def _slope_text(rising: bool | None) -> str:
+    if rising is None:
+        return ""
+    return ", והממוצע עצמו עולה" if rising else ", והממוצע עצמו יורד"
+
+
+def _band(low: float, high: float) -> str:
+    return f"{low:,.2f} עד {high:,.2f}"  # words, not a dash: stable in RTL
+
+
+def render_situation(a: Analysis) -> None:
+    """Describe the present and show what usually followed - not a forecast."""
+    s = a.snapshot
+    st.subheader(SITUATION_TITLE)
+    trend = "מעל ממוצע 50" if s.above_sma else "מתחת לממוצע 50"
+    if a.market is None:
+        market = "לא זמין כרגע"
+    else:
+        market = (
+            "S&P 500 מעל ממוצע 50 שלו" if a.market.above
+            else "S&P 500 מתחת לממוצע 50 שלו"
+        ) + _slope_text(a.market.rising)
+    st.markdown(
+        f"- **מגמה:** המחיר {trend}{_slope_text(s.sma_rising)}.\n"
+        f"- **מומנטום:** RSI {s.rsi_14:.0f} - {_RSI_ZONE_LABEL[rsi_zone(s.rsi_14)]}.\n"
+        f"- **תנודתיות:** תנועה יומית ממוצעת של {s.atr_pct:.1f}% מהמחיר (ATR).\n"
+        f"- **מצב השוק:** {market}."
+    )
+
+    reference = expected_range(s, REFERENCE_STATS)
+    own = expected_range(s, a.stats) if a.stats is not None else None
+    own_50 = _band(own.low_50, own.high_50) if own else NO_STOCK_STATS
+    own_80 = _band(own.low_80, own.high_80) if own else NO_STOCK_STATS
+    st.markdown(
+        f"**טווח המחיר ב-{STATS_RANGE_DAYS} ימי המסחר הקרובים, לפי העבר:**\n\n"
+        f"| | {_stock_column(a.stats)} | {REFERENCE_COLUMN} |\n|---|---|---|\n"
+        f"| בחצי מהמקרים | {own_50} | {_band(reference.low_50, reference.high_50)} |\n"
+        f"| ב-80% מהמקרים | {own_80} | {_band(reference.low_80, reference.high_80)} |\n"
+    )
+    st.caption(
+        f"כך נסגר המחיר אחרי {STATS_RANGE_DAYS} ימי מסחר בעבר, ביחס לתנודתיות (ATR) "
+        "של אותו יום. באחד מכל חמישה מקרים המחיר יצא מהטווח הרחב. "
+        f"סל הייחוס: {REFERENCE_TICKERS} מניות ותעודות סל, {REFERENCE_SPAN}."
+    )
+    own_rate = (
+        f" במניה הזו: {_share(a.stats.up_rate)}." if a.stats is not None else ""
+    )
+    st.info(
+        "**הכלי אינו חוזה כיוון.** בסל הייחוס, "
+        f"{_share(REFERENCE_STATS.up_rate)} מהימים הסתיימו במחיר גבוה יותר אחרי "
+        f"{STATS_UP_DAYS} ימי מסחר - בלי קשר לסיווג ירוק/צהוב/אדום.{own_rate} "
+        "אלה שיעורים מהעבר, לא תחזית.",
+        icon="🧭",
+    )
+
+
+def render_limit_statistics(a: Analysis, entry: float) -> None:
+    """Fill chance of the planned price, the limit ladder and trade odds."""
+    s = a.snapshot
+    if s.atr_14 <= 0 or s.close <= 0:
+        return
+    stock_col = _stock_column(a.stats)
+
+    def fill(stats: HistoryStats | None, depth: float) -> str:
+        if stats is None:
+            return NO_STOCK_STATS
+        return _share(limit_fill_probability(stats, depth))
+
+    depth = (s.close - entry) / s.atr_14
+    if depth <= 0:
+        st.caption(
+            "המחיר שבשדה אינו מתחת לסגירה האחרונה, ולכן הוראת Limit כזו צפויה "
+            "להתבצע מיד."
+        )
+    else:
+        own = (
+            f"{fill(a.stats, depth)} מהמקרים במניה הזו, "
+            if a.stats is not None else ""
+        )
+        st.caption(
+            f"הוראת Limit במרחק כזה מהמחיר ({depth:.1f} ATR) התמלאה בעבר תוך "
+            f"{STATS_FILL_DAYS} ימי מסחר ב-{own}"
+            f"{fill(REFERENCE_STATS, depth)} מהמקרים בסל הייחוס."
+        )
+
+    rows = "".join(
+        f"| {step.price:,.2f} | {step.pct_below:.1f}% "
+        f"| {fill(a.stats, step.depth_atr)} | {fill(REFERENCE_STATS, step.depth_atr)} |\n"
+        for step in limit_ladder(s)
+    )
+    st.markdown(
+        "**סולם Limit - איפה לחכות אם הירידה נמשכת:**\n\n"
+        # Four short columns: a fifth overflows a phone screen.
+        "| מחיר Limit | מרחק | המניה הזו | סל ייחוס |\n|---|---|---|---|\n" + rows
+    )
+    depths = ", ".join(f"{d:g}" for d in LADDER_DEPTHS)
+    st.caption(
+        "שתי העמודות האחרונות: בכמה מהמקרים בעבר המחיר ירד לרמה הזו בתוך "
+        f"{STATS_FILL_DAYS} ימי מסחר. המדרגות הן {depths} ATR מתחת לסגירה. "
+        "Limit עמוק יותר קונה מחיר טוב יותר אך מתמלא פחות. בעבר, המתנה לירידה לא "
+        "שיפרה את סיכויי העסקה, והוראות שלא התמלאו פספסו בממוצע עלייה."
+    )
+
+    state = stock_state(s, a.entry_plan.falling_knife)
+    reference = REFERENCE_STATS.odds_for(state)
+    own_odds = a.stats.odds_for(state) if a.stats is not None else None
+
+    def cell(odds: TradeOdds | None, field: str) -> str:
+        return NO_STOCK_STATS if odds is None else _share(getattr(odds, field))
+
+    st.markdown(
+        f"**מה קרה בעבר לעסקה כזו, במצב \"{_STATE_LABEL[state]}\":**\n\n"
+        f"| | {stock_col} | {REFERENCE_COLUMN} |\n|---|---|---|\n"
+        f"| היעד הושג | {cell(own_odds, 'target')} | {cell(reference, 'target')} |\n"
+        f"| הסטופ הופעל | {cell(own_odds, 'stop')} | {cell(reference, 'stop')} |\n"
+        f"| אף אחד מהם | {cell(own_odds, 'neither')} | {cell(reference, 'neither')} |\n"
+    )
+    low, high = BEAR_TARGET_RANGE
+    st.caption(
+        f"עסקה שנפתחה במחיר הסגירה, עם סטופ {STOP_ATR_MULTIPLIER:g}×ATR ויעד "
+        f"1:{REWARD_RISK_RATIO:g}, עד {STATS_TRADE_DAYS} ימי מסחר, בלי עמלות. "
+        f"בשוק יורד התמונה גרועה יותר: ב-2000-2002 וב-2008-2009 היעד הושג רק "
+        f"בין {_share(low)} ל-{_share(high)} מהמקרים. אלה שיעורים מהעבר, לא תחזית."
+    )
+
+
 ENTRY_TITLE = "תכנון כניסה (רמות מחיר והוראת Limit)"
 _CONDITION_ICON = {True: "✅", False: "❌", None: "❔"}
 
@@ -638,6 +854,7 @@ def render_entry_plan(a: Analysis, capital: float, risk_pct: float) -> float:
     m2.metric("סטופ-לוס (Stop-Loss)", f"{risk.stop_loss:,.2f}")
     m3.metric(f"יעד רווח (1:{REWARD_RISK_RATIO:g})", f"{risk.take_profit:,.2f}")
     render_live_vs_plan(a.live_quote, entry, risk.stop_loss)
+    render_limit_statistics(a, entry)
     with st.expander("איך מזינים את זה באפליקציית הברוקר?"):
         st.markdown(
             f"1. **כניסה:** בוחרים \"קניה בלימיט\" (Limit) ומזינים {entry:,.2f}. "
@@ -740,7 +957,13 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     st.caption(f"יום המסחר האחרון בנתונים: {a.snapshot.date.isoformat()}")
     render_indicators(a.snapshot)
     render_level(a.snapshot, a.level)
+    st.caption(
+        "הסיווג הוא כלל משמעת לימודי, לא תחזית: בבדיקה היסטורית מניות ירוקות, "
+        "צהובות ואדומות עלו בשיעור דומה (כ-57% תוך 20 ימי מסחר)."
+    )
     render_chart_link(a.ticker)
+    st.divider()
+    render_situation(a)  # historical statistics, shown for every level
     st.divider()
     render_valuation(a.valuation)  # shown for every level, RED included
     st.divider()

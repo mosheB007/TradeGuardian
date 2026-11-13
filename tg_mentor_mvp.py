@@ -63,8 +63,10 @@ from email.utils import parsedate_to_datetime
 from enum import Enum
 from urllib.parse import urlencode
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
+from numpy.lib.stride_tricks import sliding_window_view
 from pandas_ta.momentum import rsi
 from pandas_ta.overlap import sma
 from pandas_ta.volatility import atr
@@ -107,6 +109,18 @@ KNIFE_SLIDE_ATR = 3.0            # a decline >= 3 x ATR
 KNIFE_SMA_DISTANCE = 0.15        # close 15%+ below SMA_50
 ENTRY_PULLBACK_ATR = 1.0         # normal limit: at most 1 x ATR below the close
 ENTRY_KNIFE_DISCOUNT_ATR = 2.0   # falling knife: 2 x ATR below the close
+
+# Historical statistics for the GUI "situation picture" (PRD 3.H).
+STATS_RANGE_DAYS = 10            # horizon of the expected-range bands
+STATS_RANGE_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+STATS_FILL_DAYS = 10             # a limit order is given 10 sessions to fill
+STATS_LIMIT_DEPTHS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)  # ATRs below the close
+STATS_TRADE_DAYS = 30            # horizon for "target or stop first"
+STATS_UP_DAYS = 20               # horizon of the plain "was it higher" rate
+STATS_MIN_DAYS = 750             # ~3 years: below this, no per-stock statistics
+STATS_MIN_STATE_DAYS = 200       # per-state trade odds need this many days
+LADDER_DEPTHS = (0.5, 1.0, 1.5, 2.0, 3.0)  # limit-ladder steps shown, in ATRs
+TREND_SLOPE_DAYS = 20            # SMA_50 "rising" = above its value 20 sessions ago
 
 # News & warnings (PRD 3.D).
 EARNINGS_BLACKOUT_DAYS = 14  # earnings today..14 days ahead -> disqualify
@@ -196,6 +210,19 @@ class Snapshot:
     # True when `close` comes from today's still-open session (GUI live mode);
     # the volume fields then describe the last completed session.
     partial_session: bool = False
+    sma_50_prev: float | None = None  # SMA_50 TREND_SLOPE_DAYS sessions ago
+
+    @property
+    def sma_rising(self) -> bool | None:
+        """True if SMA_50 is above its value TREND_SLOPE_DAYS ago; None if unknown."""
+        if self.sma_50_prev is None:
+            return None
+        return self.sma_50 > self.sma_50_prev
+
+    @property
+    def atr_pct(self) -> float:
+        """Average daily range as a percent of the price."""
+        return self.atr_14 / self.close * 100 if self.close else 0.0
 
     @property
     def daily_change(self) -> float | None:
@@ -403,6 +430,11 @@ def latest_snapshot(df: pd.DataFrame) -> Snapshot:
         close_slide_ago=(
             float(df["Close"].iloc[-1 - KNIFE_SLIDE_DAYS])
             if len(df) > KNIFE_SLIDE_DAYS
+            else None
+        ),
+        sma_50_prev=(
+            _optional_float(df["SMA_50"].iloc[-1 - TREND_SLOPE_DAYS])
+            if len(df) > TREND_SLOPE_DAYS
             else None
         ),
     )
@@ -820,6 +852,272 @@ def build_live_snapshot(
         partial_session=True,
     )
     return snapshot, True
+
+
+# ---------------------------------------------------------------------------
+# Historical statistics - "what usually happened next" (GUI situation picture)
+#
+# One vectorised pass over a daily history. The app runs it live on the
+# checked stock's full history, and research/calibrate.py runs the very same
+# code on a basket to produce REFERENCE_STATS, so both use one definition.
+# These are historical frequencies - not forecasts, and never a signal.
+# ---------------------------------------------------------------------------
+
+STATE_ABOVE, STATE_BELOW, STATE_KNIFE = "above", "below", "knife"
+STOCK_STATES = (STATE_ABOVE, STATE_BELOW, STATE_KNIFE)
+
+
+@dataclass(frozen=True)
+class TradeOdds:
+    """Outcome shares of a 2xATR-stop / 1:2-target trade within the horizon."""
+
+    target: float   # share of days on which the target was reached first
+    stop: float     # share on which the stop was hit first (ties count as stop)
+    neither: float  # share on which neither happened within STATS_TRADE_DAYS
+    days: int       # sample size
+
+
+@dataclass(frozen=True)
+class HistoryStats:
+    days: int                                  # trading days in the sample
+    years: float
+    range_atr: tuple[float, ...]               # STATS_RANGE_QUANTILES, in ATRs
+    fill: tuple[tuple[float, float], ...]      # (depth in ATRs, fill probability)
+    odds: tuple[tuple[str, TradeOdds | None], ...]  # per state; None = too few days
+    up_rate: float                             # share of days higher 20 sessions on
+
+    def odds_for(self, state: str) -> TradeOdds | None:
+        return dict(self.odds).get(state)
+
+
+def history_events(history: pd.DataFrame) -> pd.DataFrame:
+    """Per-day forward outcomes for a daily OHLCV history (may be empty).
+
+    For every day with indicators and STATS_TRADE_DAYS of future data:
+    the stock state, the move after STATS_RANGE_DAYS in ATR units, whether a
+    limit order at each depth would have filled within STATS_FILL_DAYS, and
+    how a trade entered at the close (stop 2xATR, target 1:2) ended.
+    """
+    columns = ["state", "move", "up", "outcome"] + [f"fill_{d}" for d in STATS_LIMIT_DEPTHS]
+    try:
+        df = compute_indicators(history).dropna(
+            subset=["Close", "High", "Low", "SMA_50", "ATR_14", "Volume_SMA_20"]
+        )
+    except Exception:  # noqa: BLE001 - odd payloads mean "no statistics"
+        return pd.DataFrame(columns=columns)
+    n = len(df)
+    horizon = max(STATS_TRADE_DAYS, STATS_UP_DAYS, STATS_RANGE_DAYS, STATS_FILL_DAYS)
+    usable = n - horizon
+    if usable <= KNIFE_SLIDE_DAYS:
+        return pd.DataFrame(columns=columns)
+
+    close, atr_ = df["Close"].to_numpy(float), df["ATR_14"].to_numpy(float)
+    low, high = df["Low"].to_numpy(float), df["High"].to_numpy(float)
+    sma_, vol = df["SMA_50"].to_numpy(float), df["Volume"].to_numpy(float)
+    vol_avg = df["Volume_SMA_20"].to_numpy(float)
+
+    prev = np.r_[np.nan, close[:-1]]
+    ago = np.r_[np.full(KNIFE_SLIDE_DAYS, np.nan), close[:-KNIFE_SLIDE_DAYS]]
+    with np.errstate(invalid="ignore"):
+        far = close <= sma_ * (1 - KNIFE_SMA_DISTANCE)
+        panic = (prev - close >= KNIFE_DAY_DROP_ATR * atr_) & (
+            vol >= KNIFE_DAY_VOLUME_RATIO * vol_avg
+        )
+        slide = ago - close >= KNIFE_SLIDE_ATR * atr_
+    knife = far | panic | slide
+    state = np.where(knife, STATE_KNIFE, np.where(close > sma_, STATE_ABOVE, STATE_BELOW))
+
+    idx = np.arange(KNIFE_SLIDE_DAYS, usable)
+    idx = idx[atr_[idx] > 0]
+    if idx.size == 0:
+        return pd.DataFrame(columns=columns)
+    c, a = close[idx], atr_[idx]
+    out = pd.DataFrame({"state": state[idx]}, index=df.index[idx])
+    out["move"] = (close[idx + STATS_RANGE_DAYS] - c) / a
+    out["up"] = close[idx + STATS_UP_DAYS] > c
+
+    # Windows of the *following* sessions: row i covers days i+1 .. i+k.
+    low_fill = sliding_window_view(low[1:], STATS_FILL_DAYS)[idx].min(axis=1)
+    for depth in STATS_LIMIT_DEPTHS:
+        out[f"fill_{depth}"] = low_fill <= c - depth * a
+
+    lows = sliding_window_view(low[1:], STATS_TRADE_DAYS)[idx]
+    highs = sliding_window_view(high[1:], STATS_TRADE_DAYS)[idx]
+    stop_hit = lows <= (c - STOP_ATR_MULTIPLIER * a)[:, None]
+    target_hit = highs >= (c + REWARD_RISK_RATIO * STOP_ATR_MULTIPLIER * a)[:, None]
+    never = STATS_TRADE_DAYS + 1
+    first_stop = np.where(stop_hit.any(axis=1), stop_hit.argmax(axis=1), never)
+    first_target = np.where(target_hit.any(axis=1), target_hit.argmax(axis=1), never)
+    out["outcome"] = np.where(
+        first_stop <= first_target,
+        np.where(first_stop < never, "stop", "neither"),
+        "target",
+    )
+    return out[columns]
+
+
+def summarize_events(events: pd.DataFrame) -> HistoryStats | None:
+    """Turn history_events() rows into shares; None below STATS_MIN_DAYS."""
+    days = len(events)
+    if days < STATS_MIN_DAYS:
+        return None
+    odds = []
+    for state in STOCK_STATES:
+        rows = events.loc[events["state"] == state, "outcome"]
+        if len(rows) < STATS_MIN_STATE_DAYS:
+            odds.append((state, None))
+            continue
+        share = rows.value_counts(normalize=True)
+        odds.append((state, TradeOdds(
+            float(share.get("target", 0.0)), float(share.get("stop", 0.0)),
+            float(share.get("neither", 0.0)), len(rows),
+        )))
+    return HistoryStats(
+        days=days,
+        years=days / 252,
+        range_atr=tuple(float(q) for q in events["move"].quantile(list(STATS_RANGE_QUANTILES))),
+        fill=tuple((d, float(events[f"fill_{d}"].mean())) for d in STATS_LIMIT_DEPTHS),
+        odds=tuple(odds),
+        up_rate=float(events["up"].mean()),
+    )
+
+
+def compute_history_stats(history: object) -> HistoryStats | None:
+    """Statistics of one stock's own history; None if too short or unusable."""
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return None
+    try:
+        return summarize_events(history_events(history))
+    except Exception:  # noqa: BLE001 - statistics are optional, never fatal
+        return None
+
+
+def fetch_full_history(ticker: str) -> pd.DataFrame | None:
+    """Every daily bar Yahoo has for `ticker`; None on any failure. Never raises."""
+    try:
+        history = yf.Ticker(ticker).history(period="max", interval=HISTORY_INTERVAL)
+        if isinstance(history, pd.DataFrame) and not history.empty:
+            return history
+    except Exception:  # noqa: BLE001 - optional data, must never stop the analysis
+        pass
+    return None
+
+
+@dataclass(frozen=True)
+class RangeForecast:
+    """Where the close landed after STATS_RANGE_DAYS sessions, in price units."""
+
+    low_80: float
+    low_50: float
+    median: float
+    high_50: float
+    high_80: float
+
+
+def expected_range(snapshot: Snapshot, stats: HistoryStats) -> RangeForecast:
+    """Scale the historical ATR-unit quantiles to this stock's price and ATR."""
+    low_80, low_50, median, high_50, high_80 = (
+        snapshot.close + q * snapshot.atr_14 for q in stats.range_atr
+    )
+    return RangeForecast(max(low_80, 0.0), max(low_50, 0.0), median, high_50, high_80)
+
+
+def limit_fill_probability(stats: HistoryStats, depth_atr: float) -> float:
+    """Share of days a limit `depth_atr` ATRs below the close filled.
+
+    Linear interpolation between the measured depths; at or above the close
+    it is 1.0, and beyond the deepest measured depth it stays at that value
+    (an upper bound).
+    """
+    if depth_atr <= 0:
+        return 1.0
+    points = ((0.0, 1.0),) + stats.fill
+    for (d0, p0), (d1, p1) in zip(points, points[1:]):
+        if depth_atr <= d1:
+            return p0 + (p1 - p0) * (depth_atr - d0) / (d1 - d0)
+    return points[-1][1]
+
+
+@dataclass(frozen=True)
+class LadderStep:
+    depth_atr: float
+    price: float
+    pct_below: float  # distance below the close, in percent (positive number)
+
+
+def limit_ladder(snapshot: Snapshot) -> tuple[LadderStep, ...]:
+    """Candidate limit prices below the close, one per LADDER_DEPTHS step."""
+    steps = []
+    for depth in LADDER_DEPTHS:
+        price = snapshot.close - depth * snapshot.atr_14
+        if price <= 0 or snapshot.close <= 0:
+            continue
+        steps.append(LadderStep(depth, round(price, 2), (1 - price / snapshot.close) * 100))
+    return tuple(steps)
+
+
+def stock_state(snapshot: Snapshot, falling_knife: bool) -> str:
+    if falling_knife:
+        return STATE_KNIFE
+    return STATE_ABOVE if snapshot.above_sma else STATE_BELOW
+
+
+@dataclass(frozen=True)
+class MarketRegime:
+    """S&P 500 (SPY) against its own SMA_50."""
+
+    close: float
+    sma_50: float
+    above: bool
+    rising: bool | None  # SMA_50 higher than TREND_SLOPE_DAYS sessions ago
+
+
+def market_regime(history: object) -> MarketRegime | None:
+    """Regime from a daily index/ETF history; None if unusable. Never raises."""
+    try:
+        snapshot = latest_snapshot(compute_indicators(history))
+    except Exception:  # noqa: BLE001 - optional context
+        return None
+    return MarketRegime(
+        snapshot.close, snapshot.sma_50, snapshot.above_sma, snapshot.sma_rising
+    )
+
+
+# Reference basket: 55 US stocks and ETFs, every daily bar Yahoo has for them
+# (1962-2026, ~510,000 trading days). Regenerate with research/calibrate.py.
+# The last-10-years slice is within ~1 point of these on every figure.
+REFERENCE_STATS = HistoryStats(
+    days=510132,
+    years=65.0,
+    range_atr=(-2.55, -1.15, 0.30, 1.74, 3.16),
+    fill=((0.5, 0.766), (1.0, 0.588), (1.5, 0.439), (2.0, 0.319), (2.5, 0.227),
+          (3.0, 0.160), (4.0, 0.078)),
+    odds=(
+        ("above", TradeOdds(0.316, 0.517, 0.166, 303644)),
+        ("below", TradeOdds(0.305, 0.502, 0.194, 177292)),
+        ("knife", TradeOdds(0.260, 0.486, 0.254, 29196)),
+    ),
+    up_rate=0.574,
+)
+REFERENCE_TICKERS = 55
+REFERENCE_SPAN = "1962-2026"
+# Bear markets are the exception the averages hide: in 2000-2002 and 2008-2009
+# the 1:2 target was reached on only ~16-25% of days (vs ~31% overall), and in
+# 2000-2002 only 49% of days were higher 20 sessions later.
+BEAR_TARGET_RANGE = (0.16, 0.25)
+
+RSI_OVERSOLD, RSI_OVERBOUGHT = 30.0, 70.0
+
+
+def rsi_zone(rsi_value: float) -> str:
+    """'oversold' / 'weak' / 'firm' / 'overbought' (boundaries 30, 45, 70)."""
+    if rsi_value < RSI_OVERSOLD:
+        return "oversold"
+    if rsi_value < RSI_THRESHOLD:
+        return "weak"
+    if rsi_value <= RSI_OVERBOUGHT:
+        return "firm"
+    return "overbought"
 
 
 # ---------------------------------------------------------------------------
