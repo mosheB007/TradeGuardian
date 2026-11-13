@@ -93,6 +93,15 @@ RISK_PER_TRADE = 0.01       # max 1% of capital lost if the stop-loss is hit
 STOP_ATR_MULTIPLIER = 2.0   # stop-loss distance = 2 x ATR below entry
 REWARD_RISK_RATIO = 2.0     # take-profit distance = 2 x risk (1:2)
 
+# Entry planning (GUI) - reference levels, never a trading signal.
+SUPPORT_LOOKBACK = 20            # support = lowest low of the previous 20 sessions
+KNIFE_DAY_DROP_ATR = 1.5         # one-day drop >= 1.5 x ATR ...
+KNIFE_DAY_VOLUME_RATIO = 1.5     # ... on volume >= 1.5 x its 20-day average
+KNIFE_SLIDE_DAYS = 5             # or, over the last 5 sessions,
+KNIFE_SLIDE_ATR = 3.0            # a decline >= 3 x ATR
+ENTRY_PULLBACK_ATR = 1.0         # normal limit: at most 1 x ATR below the close
+ENTRY_KNIFE_DISCOUNT_ATR = 2.0   # falling knife: 2 x ATR below the close
+
 # News & warnings (PRD 3.D).
 EARNINGS_BLACKOUT_DAYS = 14  # earnings today..14 days ahead -> disqualify
 NEWS_LIMIT = 5               # max headlines shown
@@ -174,7 +183,10 @@ class Snapshot:
     volume: float
     volume_sma_20: float
     atr_14: float
-    prev_close: float | None = None  # previous trading day's close (display only)
+    prev_close: float | None = None  # previous trading day's close
+    # Entry planning (optional so older callers keep working):
+    low_20: float | None = None           # lowest low of the previous 20 sessions
+    close_slide_ago: float | None = None  # close KNIFE_SLIDE_DAYS sessions ago
 
     @property
     def daily_change(self) -> float | None:
@@ -344,7 +356,14 @@ def compute_indicators(history: pd.DataFrame) -> pd.DataFrame:
     df["RSI_14"] = rsi(df["Close"], length=RSI_LENGTH)
     df["Volume_SMA_20"] = sma(df["Volume"], length=VOLUME_SMA_LENGTH)
     df["ATR_14"] = atr(df["High"], df["Low"], df["Close"], length=ATR_LENGTH)
+    # Support for entry planning: today's bar is excluded (shift), so a calm
+    # pullback that touches the level is not confused with the level itself.
+    df["Low_20"] = df["Low"].rolling(SUPPORT_LOOKBACK).min().shift(1)
     return df
+
+
+def _optional_float(value: object) -> float | None:
+    return None if pd.isna(value) else float(value)
 
 
 def latest_snapshot(df: pd.DataFrame) -> Snapshot:
@@ -371,6 +390,12 @@ def latest_snapshot(df: pd.DataFrame) -> Snapshot:
         atr_14=float(last["ATR_14"]),
         # The 6-month history already holds the previous session: no extra fetch.
         prev_close=float(df["Close"].iloc[-2]) if len(df) >= 2 else None,
+        low_20=_optional_float(last["Low_20"]) if "Low_20" in df.columns else None,
+        close_slide_ago=(
+            float(df["Close"].iloc[-1 - KNIFE_SLIDE_DAYS])
+            if len(df) > KNIFE_SLIDE_DAYS
+            else None
+        ),
     )
 
 
@@ -673,20 +698,24 @@ def compute_risk_plan(
     snapshot: Snapshot,
     capital: float = VIRTUAL_CAPITAL,
     risk_pct: float = RISK_PER_TRADE,
+    entry: float | None = None,
 ) -> RiskPlan:
     """Compute stop-loss, 1:2 take-profit and max share count for `snapshot`.
+
+    `entry` is the planned entry price; by default the last close.
 
     The share count is floored so the loss at the stop never exceeds
     `capital * risk_pct`, and is also capped at what `capital` can buy.
     A plan is invalid (0 shares) when ATR is zero or the stop is <= 0.
     """
-    entry = snapshot.close
+    if entry is None:
+        entry = snapshot.close
     stop_loss = entry - STOP_ATR_MULTIPLIER * snapshot.atr_14
     risk_per_share = entry - stop_loss
     take_profit = entry + REWARD_RISK_RATIO * risk_per_share
     risk_budget = capital * risk_pct
 
-    is_valid = risk_per_share > 0 and stop_loss > 0
+    is_valid = risk_per_share > 0 and stop_loss > 0 and entry > 0
     shares = 0
     capped = False
     if is_valid:
@@ -708,6 +737,105 @@ def compute_risk_plan(
         capped_by_capital=capped,
         is_valid=is_valid,
     )
+
+
+# ---------------------------------------------------------------------------
+# Entry planning - educational reference levels (GUI only)
+#
+# A fixed, transparent rule on daily prices: it does NOT read the news and
+# does not predict anything. The limit price is a reference level for a
+# learning plan, never a trading signal.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EntryCondition:
+    """One checklist line. ok: True = met, False = not met, None = unknown."""
+
+    label: str
+    ok: bool | None
+
+
+@dataclass(frozen=True)
+class EntryPlan:
+    conditions: tuple[EntryCondition, ...]
+    falling_knife: bool           # panic day or sharp multi-day slide
+    support: float | None         # nearest support level below the close
+    limit_price: float            # suggested limit-order reference price
+
+
+def _is_panic_day(s: Snapshot) -> bool | None:
+    """Sharp one-day drop on unusually heavy volume; None if unknown."""
+    if s.prev_close is None or s.atr_14 <= 0:
+        return None
+    drop = s.prev_close - s.close
+    return (
+        drop >= KNIFE_DAY_DROP_ATR * s.atr_14
+        and s.volume >= KNIFE_DAY_VOLUME_RATIO * s.volume_sma_20
+    )
+
+
+def _is_sharp_slide(s: Snapshot) -> bool | None:
+    """Close fell KNIFE_SLIDE_ATR x ATR or more in KNIFE_SLIDE_DAYS sessions."""
+    if s.close_slide_ago is None or s.atr_14 <= 0:
+        return None
+    return s.close_slide_ago - s.close >= KNIFE_SLIDE_ATR * s.atr_14
+
+
+def _negate(value: bool | None) -> bool | None:
+    return None if value is None else not value
+
+
+def compute_entry_plan(
+    snapshot: Snapshot,
+    earnings_blocked: bool | None = None,
+    valuation_tier: ValuationTier = ValuationTier.UNKNOWN,
+) -> EntryPlan:
+    """Build the entry checklist and a rule-based limit-price reference.
+
+    Limit price:
+      * falling knife -> close - ENTRY_KNIFE_DISCOUNT_ATR x ATR (conditional
+        on the price stabilizing first);
+      * otherwise     -> the nearest support below the close (SMA_50 or the
+        previous 20-day low), but no further than ENTRY_PULLBACK_ATR x ATR.
+    """
+    s = snapshot
+    panic, slide = _is_panic_day(s), _is_sharp_slide(s)
+    valuation_ok = {
+        ValuationTier.ATTRACTIVE: True,
+        ValuationTier.FAIR: True,
+        ValuationTier.EXPENSIVE: False,
+        ValuationTier.UNPROFITABLE: False,
+    }.get(valuation_tier)
+    conditions = (
+        EntryCondition("מגמה חיובית: המחיר מעל ממוצע 50", s.above_sma),
+        EntryCondition(
+            "אין ירידת פאניקה: לא נרשמה ירידה יומית חדה במחזור מסחר חריג",
+            _negate(panic),
+        ),
+        EntryCondition(
+            f"אין צניחה מתמשכת: המחיר לא ירד בחדות ב-{KNIFE_SLIDE_DAYS} "
+            "ימי המסחר האחרונים",
+            _negate(slide),
+        ),
+        EntryCondition(
+            f"אין דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים",
+            _negate(earnings_blocked),
+        ),
+        EntryCondition("התמחור אינו מנופח והחברה רווחית (לפי PEG)", valuation_ok),
+    )
+    falling_knife = panic is True or slide is True
+
+    levels = [lvl for lvl in (s.sma_50, s.low_20) if lvl is not None and lvl < s.close]
+    support = max(levels, default=None)
+    if falling_knife:
+        limit = s.close - ENTRY_KNIFE_DISCOUNT_ATR * s.atr_14
+    else:
+        limit = s.close - ENTRY_PULLBACK_ATR * s.atr_14
+        if support is not None:
+            limit = max(support, limit)
+    if limit <= 0:  # degenerate data: never suggest a non-positive price
+        limit = s.close
+    return EntryPlan(conditions, falling_knife, support, round(limit, 2))
 
 
 # ---------------------------------------------------------------------------
