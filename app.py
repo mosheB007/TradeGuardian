@@ -17,9 +17,11 @@ Flow (as in the CLI, except that the GUI also lists headlines for RED stocks):
        educational valuation section (P/E, Forward P/E, PEG) that never
        affects the level.
     3. Headlines, for every level.
-    4. RED -> a note that the capital shield is not calculated; stop.
+    4. Entry planning, for every level: a checklist, reference levels and a
+       rule-based limit / stop-loss / target the user may override.
+    5. RED -> a note that share sizing is not calculated; stop.
        GREEN/YELLOW: "approve" / "disqualify" buttons.
-       Approve -> capital shield (plus a red earnings reminder when a
+       Approve -> capital shield at the planned entry price (plus a red earnings reminder when a
        report is due within the blackout window).
        Disqualify -> red veto message.
 
@@ -39,10 +41,14 @@ import streamlit as st
 from tg_mentor_mvp import (
     EARNINGS_BLACKOUT_DAYS,
     EARNINGS_UNKNOWN_MESSAGE,
+    ENTRY_KNIFE_DISCOUNT_ATR,
+    ENTRY_PULLBACK_ATR,
+    EntryPlan,
     REWARD_RISK_RATIO,
     RISK_PER_TRADE,
     RSI_THRESHOLD,
     STOP_ATR_MULTIPLIER,
+    SUPPORT_LOOKBACK,
     YAHOO_NEWS_URL,
     Level,
     NewsItem,
@@ -53,6 +59,7 @@ from tg_mentor_mvp import (
     Valuation,
     ValuationTier,
     classify,
+    compute_entry_plan,
     compute_indicators,
     compute_risk_plan,
     drop_incomplete_session,
@@ -117,7 +124,7 @@ APPROVE, VETO = "approve", "veto"
 
 RED_NO_RISK_PLAN_MESSAGE = (
     "[אדום] מניה במגמה שלילית (מתחת לממוצע 50) – "
-    "מגן ההון אינו מחושב עבור מניות אדומות."
+    "כמות המניות ומגן ההון המלא אינם מחושבים עבור מניות אדומות."
 )
 EARNINGS_RISK_REMINDER = (
     f"תזכורת קריטית: קיים דוח כספי ב-{EARNINGS_BLACKOUT_DAYS} הימים הקרובים. "
@@ -141,6 +148,7 @@ class Analysis:
     level: Level
     news: tuple[NewsItem, ...] = ()
     valuation: Valuation = Valuation()  # educational; never affects `level`
+    entry_plan: EntryPlan | None = None  # always set by run_analysis
 
     @property
     def earnings_blocked(self) -> bool:
@@ -163,8 +171,15 @@ def run_analysis(raw_ticker: str) -> Analysis:
     level = classify(snapshot)
     news = tuple(fetch_news(ticker))  # shown for every level, RED included
     valuation = fetch_valuation(ticker)  # best-effort, never raises
+    entry_plan = compute_entry_plan(
+        snapshot,
+        # Unknown earnings date -> unknown condition, not a pass.
+        None if earnings is None else is_earnings_too_close(earnings, today),
+        valuation.tier,
+    )
     return Analysis(
-        ticker, today, session_open, earnings, snapshot, level, news, valuation
+        ticker, today, session_open, earnings, snapshot, level, news, valuation,
+        entry_plan,
     )
 
 
@@ -493,7 +508,7 @@ def render_risk(plan: RiskPlan, earnings_blocked: bool = False) -> None:
             f"| הון וירטואלי | {_money(plan.capital)} |\n"
             f"| סיכון מקסימלי לעסקה ({pct}) | {_money(plan.risk_budget)} |\n"
             f"| תנודתיות יומית ממוצעת (ATR) | {plan.atr:,.2f} |\n"
-            f"| מחיר כניסה (סגירה אחרונה) | {plan.entry:,.2f} |\n"
+            f"| מחיר כניסה מתוכנן (Limit) | {plan.entry:,.2f} |\n"
             f"| קו הגנה (Stop-Loss) - מרווח של פי {STOP_ATR_MULTIPLIER:g} מהתנודתיות "
             f"| {plan.stop_loss:,.2f} |\n"
             f"| הפסד אפשרי על כל מניה בודדת | {plan.risk_per_share:,.2f} |\n"
@@ -521,6 +536,94 @@ def render_risk(plan: RiskPlan, earnings_blocked: bool = False) -> None:
     )
 
 
+ENTRY_TITLE = "תכנון כניסה (רמות מחיר והוראת Limit)"
+_CONDITION_ICON = {True: "✅", False: "❌", None: "❔"}
+
+
+def render_entry_plan(a: Analysis, capital: float, risk_pct: float) -> float:
+    """Checklist, reference levels and a limit/stop/target plan.
+
+    Returns the planned entry price (the user may override the suggestion),
+    which the capital shield then uses.
+    """
+    s, plan = a.snapshot, a.entry_plan
+    st.subheader(ENTRY_TITLE)
+    st.caption(
+        "נקודות ייחוס לימודיות לפי כלל קבוע על נתוני מחיר יומיים. "
+        "הכלי אינו קורא את תוכן החדשות ואינו חוזה את המחיר - ההחלטה שלך בלבד."
+    )
+    st.markdown("**רשימת תנאים לפני כניסה:**")
+    st.markdown(
+        "\n".join(f"- {_CONDITION_ICON[c.ok]} {c.label}" for c in plan.conditions)
+    )
+    st.caption("✅ מתקיים · ❌ לא מתקיים · ❔ לא ידוע (אין נתון)")
+
+    if plan.falling_knife:
+        st.error(
+            "**סכין נופלת - לא תופסים אותה באוויר**\n\n"
+            "המניה ירדה בחדות. המחיר שלהלן הוא **מחיר מותנה**: שוקלים אותו רק לאחר "
+            "שהמחיר מתייצב. סימני התייצבות לחפש בגרף: כמה ימים שבהם השפל כבר לא "
+            "נשבר, מחזור מסחר שנרגע, ונר ירוק שנסגר מעל הגבוה של היום הקודם.",
+            icon="🔪",
+        )
+    elif a.level is Level.RED:
+        st.error(
+            "**תוכנית מותנית - התנאים אינם מתקיימים כרגע**\n\n"
+            "המניה במגמה שלילית (מתחת לממוצע 50). המספרים שלהלן הם לימוד ותכנון "
+            "מראש בלבד, עד שהמגמה תשתנה.",
+            icon="🛑",
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("סגירה אחרונה", f"{s.close:,.2f}")
+    c2.metric("ממוצע 50", f"{s.sma_50:,.2f}")
+    c3.metric(
+        f"שפל {SUPPORT_LOOKBACK} יום",
+        f"{s.low_20:,.2f}" if s.low_20 is not None else VALUATION_NOT_AVAILABLE,
+    )
+    c4.metric("תנודתיות (ATR)", f"{s.atr_14:,.2f}")
+
+    entry = float(st.number_input(
+        "מחיר כניסה מתוכנן (Limit) - אפשר לשנות",
+        min_value=0.01,
+        value=float(plan.limit_price),
+        step=0.5,
+        format="%.2f",
+        # Keyed per check, so a new ticker starts from its own suggestion.
+        key=f"entry_{a.ticker}_{s.date.isoformat()}",
+    ))
+    if plan.falling_knife:
+        rule = f"סגירה אחרונה פחות {ENTRY_KNIFE_DISCOUNT_ATR:g}×ATR (מחיר מותנה)"
+    elif plan.support is not None and plan.limit_price == round(plan.support, 2):
+        rule = "רמת התמיכה הקרובה מתחת למחיר (ממוצע 50 או שפל 20 יום)"
+    else:
+        rule = f"סגירה אחרונה פחות {ENTRY_PULLBACK_ATR:g}×ATR"
+    st.caption(f"המחיר המוצע: {plan.limit_price:,.2f} - לפי הכלל: {rule}.")
+
+    risk = compute_risk_plan(s, capital=capital, risk_pct=risk_pct, entry=entry)
+    if not risk.is_valid:
+        st.error("לא ניתן לחשב סטופ-לוס למחיר הזה: ה-ATR אפס או שהסטופ יוצא שלילי.")
+        return entry
+    distance = (entry / s.close - 1) * 100 if s.close else 0.0
+    m1, m2, m3 = st.columns(3)
+    m1.metric(
+        "קניה בלימיט (Limit)", f"{entry:,.2f}", f"{distance:+.1f}% מהסגירה",
+        delta_color="off", delta_arrow="off",
+    )
+    m2.metric("סטופ-לוס (Stop-Loss)", f"{risk.stop_loss:,.2f}")
+    m3.metric(f"יעד רווח (1:{REWARD_RISK_RATIO:g})", f"{risk.take_profit:,.2f}")
+    with st.expander("איך מזינים את זה באפליקציית הברוקר?"):
+        st.markdown(
+            f"1. **כניסה:** בוחרים \"קניה בלימיט\" (Limit) ומזינים {entry:,.2f}. "
+            "ההוראה תתבצע רק אם המחיר יירד לרמה הזו או מתחתיה - ייתכן שלא תתבצע כלל.\n"
+            f"2. **הגנה:** רק לאחר שהקנייה בוצעה, שמים הוראת **מכירה** בסטופ (Stop) "
+            f"ב-{risk.stop_loss:,.2f}.\n\n"
+            "שים לב: \"קניה בסטופ\" היא הוראה אחרת - קנייה כשהמחיר **עולה** מעל רמה "
+            "מסוימת - והיא אינה הסטופ-לוס שלך."
+        )
+    return entry
+
+
 def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     if a.session_open:
         st.info(
@@ -539,8 +642,10 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
     render_valuation(a.valuation)  # shown for every level, RED included
     st.divider()
     render_news(a.ticker, a.news)  # shown for every level, RED included
+    st.divider()
+    entry = render_entry_plan(a, capital, risk_pct)  # every level, RED included
 
-    # The veto step and the capital shield are for GREEN/YELLOW only.
+    # The veto step and the full capital shield are for GREEN/YELLOW only.
     if a.level is Level.RED:
         st.info(RED_NO_RISK_PLAN_MESSAGE, icon="🛑")
         return
@@ -549,7 +654,9 @@ def render_analysis(a: Analysis, capital: float, risk_pct: float) -> None:
         st.divider()
         # Recomputed on every rerun, so sidebar changes apply immediately.
         render_risk(
-            compute_risk_plan(a.snapshot, capital=capital, risk_pct=risk_pct),
+            compute_risk_plan(
+                a.snapshot, capital=capital, risk_pct=risk_pct, entry=entry
+            ),
             earnings_blocked=a.earnings_blocked,
         )
     elif decision == VETO:

@@ -27,7 +27,7 @@ RISK_TITLE = "מגן הון (ניהול סיכונים לעסקה מדומה)"
 DISCLAIMER = "אינה מספקת איתותי מסחר"
 RED_NO_RISK_PLAN = (
     "[אדום] מניה במגמה שלילית (מתחת לממוצע 50) – "
-    "מגן ההון אינו מחושב עבור מניות אדומות."
+    "כמות המניות ומגן ההון המלא אינם מחושבים עבור מניות אדומות."
 )
 EARNINGS_CONTINUES = "הניתוח ממשיך לצורכי לימוד בלבד - שים לב לסיכון הגבוה לפני דוח כספי."
 EARNINGS_REMINDER = (
@@ -276,6 +276,7 @@ class TestLevels:
             "דוח לימודי טכני: NVDA",
             "בדיקת תמחור וערך (האם המניה יקרה?)",
             "חדשות ואזהרות",
+            "תכנון כניסה (רמות מחיר והוראת Limit)",
         ]
 
     def test_red_without_headlines_shows_manual_check(self, monkeypatch):
@@ -399,7 +400,7 @@ class TestEarnings:
         self, monkeypatch
     ):
         self.patch_close_earnings(monkeypatch)
-        plan = tg.compute_risk_plan(tg.latest_snapshot(tg.compute_indicators(self.df)))
+        plan = expected_risk(self.df)
         at = run_check()
         at.button(key="approve").click()
         at.run()
@@ -638,6 +639,224 @@ class TestValuation:
 
 
 # ---------------------------------------------------------------------------
+# Entry planning (checklist, falling knife, limit / stop / target)
+# ---------------------------------------------------------------------------
+
+ENTRY_TITLE = "תכנון כניסה (רמות מחיר והוראת Limit)"
+LIMIT_LABEL = "קניה בלימיט (Limit)"
+STOP_LABEL = "סטופ-לוס (Stop-Loss)"
+TARGET_LABEL = "יעד רווח (1:2)"
+KNIFE_HEADING = "**סכין נופלת - לא תופסים אותה באוויר**"
+CONDITIONAL_HEADING = "**תוכנית מותנית - התנאים אינם מתקיימים כרגע**"
+# Uptrend, then a crash on 4x volume: still above SMA_50 (not RED).
+KNIFE_CLOSES = np.r_[np.linspace(100, 200, 119), 185.0]
+KNIFE_VOLUMES = np.r_[np.full(119, 1_000_000.0), 4_000_000.0]
+
+
+def expected_entry(df, earnings_blocked=None, tier=tg.ValuationTier.UNKNOWN):
+    """(snapshot, entry plan) the app should compute for `df`."""
+    snap = tg.latest_snapshot(tg.compute_indicators(df))
+    return snap, tg.compute_entry_plan(snap, earnings_blocked, tier)
+
+
+def expected_risk(df, entry=None, **kwargs):
+    """Capital shield at the suggested limit price (or a custom entry)."""
+    snap, plan = expected_entry(df)
+    return tg.compute_risk_plan(
+        snap, entry=plan.limit_price if entry is None else entry, **kwargs
+    )
+
+
+def entry_input(at):
+    return next(n for n in at.number_input if n.key and n.key.startswith("entry_"))
+
+
+def metric_value(at, label):
+    return next(m for m in at.metric if m.label == label).value
+
+
+class TestEntryPlan:
+    def check(self, monkeypatch, closes=GREEN_CLOSES, volumes=GREEN_VOLUMES, **kwargs):
+        self.df = make_ohlcv(closes, volumes)
+        patch_market(monkeypatch, history_result=self.df, **kwargs)
+        return run_check()
+
+    def checklist(self, at):
+        return next(str(m.value) for m in at.markdown if "מגמה חיובית" in str(m.value))
+
+    def test_section_sits_between_news_and_the_veto_step(self, monkeypatch):
+        at = self.check(monkeypatch)
+        titles = [str(s.value) for s in at.subheader]
+        assert titles.index("חדשות ואזהרות") < titles.index(ENTRY_TITLE)
+        assert {"approve", "veto"} <= button_keys(at)
+        assert "אינו קורא את תוכן החדשות" in text_of(at.caption)
+
+    def test_checklist_shows_met_and_unknown_conditions(self, monkeypatch):
+        lines = self.checklist(self.check(monkeypatch)).splitlines()
+        assert len(lines) == 5
+        assert lines[0].startswith("- ✅ מגמה חיובית")
+        assert lines[1].startswith("- ✅ אין ירידת פאניקה")
+        assert lines[2].startswith("- ✅ אין צניחה מתמשכת")
+        assert lines[3].startswith("- ❔ אין דוח כספי")   # no earnings date
+        assert lines[4].startswith("- ❔ התמחור")         # no valuation data
+
+    def test_checklist_marks_failed_conditions(self, monkeypatch):
+        at = self.check(
+            monkeypatch, closes=DOWNTREND, volumes=None,
+            calendar={"Earnings Date": [days_from_today(5)]},
+            info={"trailingPegRatio": 3.0},
+        )
+        lines = self.checklist(at).splitlines()
+        assert lines[0].startswith("- ❌ מגמה חיובית")
+        assert lines[3].startswith("- ❌ אין דוח כספי")
+        assert lines[4].startswith("- ❌ התמחור")
+
+    def test_checklist_marks_good_earnings_and_valuation(self, monkeypatch):
+        at = self.check(
+            monkeypatch,
+            calendar={"Earnings Date": [days_from_today(40)]},
+            info={"trailingPegRatio": 0.8},
+        )
+        lines = self.checklist(at).splitlines()
+        assert lines[3].startswith("- ✅") and lines[4].startswith("- ✅")
+
+    def test_no_verdict_or_score_is_shown(self, monkeypatch):
+        text = page_text(self.check(monkeypatch))
+        for phrase in ("כדאי לקנות", "מומלץ לקנות", "מתוך 5"):
+            assert phrase not in text
+
+    def test_reference_levels_are_shown(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, _ = expected_entry(self.df)
+        assert metric_value(at, "סגירה אחרונה") == f"{snap.close:,.2f}"
+        assert metric_value(at, "ממוצע 50") == f"{snap.sma_50:,.2f}"
+        assert metric_value(at, "שפל 20 יום") == f"{snap.low_20:,.2f}"
+        assert metric_value(at, "תנודתיות (ATR)") == f"{snap.atr_14:,.2f}"
+
+    def test_entry_defaults_to_the_suggested_limit(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, plan = expected_entry(self.df)
+        risk = expected_risk(self.df)
+        assert entry_input(at).value == pytest.approx(plan.limit_price)
+        assert plan.limit_price < snap.close
+        assert metric_value(at, LIMIT_LABEL) == f"{plan.limit_price:,.2f}"
+        assert metric_value(at, STOP_LABEL) == f"{risk.stop_loss:,.2f}"
+        assert metric_value(at, TARGET_LABEL) == f"{risk.take_profit:,.2f}"
+        assert f"המחיר המוצע: {plan.limit_price:,.2f}" in text_of(at.caption)
+
+    def test_limit_metric_shows_distance_from_the_close(self, monkeypatch):
+        at = self.check(monkeypatch)
+        snap, plan = expected_entry(self.df)
+        metric = next(m for m in at.metric if m.label == LIMIT_LABEL)
+        distance = (plan.limit_price / snap.close - 1) * 100
+        assert metric.proto.delta == f"{distance:+.1f}% מהסגירה"
+        assert metric.proto.color == MetricProto.MetricColor.GRAY
+
+    def test_changing_the_entry_price_recalculates(self, monkeypatch):
+        at = self.check(monkeypatch)
+        entry_input(at).set_value(140.0)
+        at.run()
+        assert not at.exception
+        risk = expected_risk(self.df, entry=140.0)
+        assert metric_value(at, LIMIT_LABEL) == "140.00"
+        assert metric_value(at, STOP_LABEL) == f"{risk.stop_loss:,.2f}"
+        assert metric_value(at, TARGET_LABEL) == f"{risk.take_profit:,.2f}"
+
+    def test_entry_price_too_low_for_a_stop_shows_an_error(self, monkeypatch):
+        at = self.check(monkeypatch)
+        entry_input(at).set_value(0.5)
+        at.run()
+        assert not at.exception
+        assert "לא ניתן לחשב סטופ-לוס למחיר הזה" in text_of(at.error)
+        assert STOP_LABEL not in [m.label for m in at.metric]
+
+    def test_broker_instructions_use_the_plan_numbers(self, monkeypatch):
+        at = self.check(monkeypatch)
+        _, plan = expected_entry(self.df)
+        risk = expected_risk(self.df)
+        assert "איך מזינים את זה באפליקציית הברוקר?" in [e.label for e in at.expander]
+        guide = text_of(at.markdown)
+        assert f'בוחרים "קניה בלימיט" (Limit) ומזינים {plan.limit_price:,.2f}' in guide
+        assert f"בסטופ (Stop) ב-{risk.stop_loss:,.2f}" in guide
+        assert '"קניה בסטופ" היא הוראה אחרת' in guide
+
+    def test_calm_stock_shows_no_knife_or_conditional_banner(self, monkeypatch):
+        errors = text_of(self.check(monkeypatch).error)
+        assert KNIFE_HEADING not in errors and CONDITIONAL_HEADING not in errors
+
+    def test_falling_knife_warns_and_uses_the_conditional_price(self, monkeypatch):
+        at = self.check(monkeypatch, closes=KNIFE_CLOSES, volumes=KNIFE_VOLUMES)
+        snap, plan = expected_entry(self.df)
+        assert plan.falling_knife and snap.above_sma  # the scenario is what we think
+        errors = text_of(at.error)
+        assert KNIFE_HEADING in errors
+        assert "מחיר מותנה" in errors and "סימני התייצבות" in errors
+        assert self.checklist(at).splitlines()[1].startswith("- ❌ אין ירידת פאניקה")
+        assert entry_input(at).value == pytest.approx(
+            round(snap.close - 2 * snap.atr_14, 2)
+        )
+        assert "פחות 2×ATR (מחיר מותנה)" in text_of(at.caption)
+        # Not RED, so the veto step is still offered.
+        assert {"approve", "veto"} <= button_keys(at)
+
+    def test_red_stock_gets_a_conditional_plan_without_sizing(self, monkeypatch):
+        at = self.check(monkeypatch, closes=DOWNTREND, volumes=None)
+        _, plan = expected_entry(self.df)
+        risk = expected_risk(self.df)
+        assert not plan.falling_knife  # slow downtrend, not a crash
+        assert CONDITIONAL_HEADING in text_of(at.error)
+        assert metric_value(at, LIMIT_LABEL) == f"{plan.limit_price:,.2f}"
+        assert metric_value(at, STOP_LABEL) == f"{risk.stop_loss:,.2f}"
+        assert metric_value(at, TARGET_LABEL) == f"{risk.take_profit:,.2f}"
+        # ...but no share sizing, no veto step and no capital shield.
+        assert RED_NO_RISK_PLAN in text_of(at.info)
+        assert "כמות מניות מקסימלית" not in [m.label for m in at.metric]
+        assert {"approve", "veto"}.isdisjoint(button_keys(at))
+        assert RISK_TITLE not in page_text(at)
+
+    def test_red_crash_shows_the_knife_banner_not_both(self, monkeypatch):
+        closes = np.r_[np.linspace(100, 160, 119), 120.0]
+        at = self.check(monkeypatch, closes=closes, volumes=KNIFE_VOLUMES)
+        errors = text_of(at.error)
+        assert "על הגדר" in errors  # technical RED
+        assert KNIFE_HEADING in errors and CONDITIONAL_HEADING not in errors
+
+    def test_capital_shield_uses_the_planned_entry_price(self, monkeypatch):
+        at = self.check(monkeypatch)
+        entry_input(at).set_value(140.0)
+        at.run()
+        at.button(key="approve").click()
+        at.run()
+        assert not at.exception
+        risk = expected_risk(self.df, entry=140.0)
+        table = next(m.value for m in at.markdown if "| נתון | ערך |" in m.value)
+        assert "| מחיר כניסה מתוכנן (Limit) | 140.00 |" in table
+        assert metric_value(at, "כמות מניות מקסימלית") == f"{risk.shares:,}"
+        assert entry_input(at).value == pytest.approx(140.0)  # kept across reruns
+
+    def test_changing_the_entry_after_approval_updates_the_shield(self, monkeypatch):
+        at = self.check(monkeypatch)
+        at.button(key="approve").click()
+        at.run()
+        entry_input(at).set_value(120.0)
+        at.run()
+        risk = expected_risk(self.df, entry=120.0)
+        assert metric_value(at, "כמות מניות מקסימלית") == f"{risk.shares:,}"
+        assert metric_value(at, "קו הגנה (Stop-Loss)") == f"{risk.stop_loss:,.2f}"
+
+    def test_new_ticker_starts_from_its_own_suggestion(self, monkeypatch):
+        at = self.check(monkeypatch)
+        entry_input(at).set_value(140.0)
+        at.run()
+        at.text_input(key="ticker").input("AMD")
+        at.button(key="check").click()
+        at.run()
+        _, plan = expected_entry(self.df)
+        assert entry_input(at).key.startswith("entry_AMD_")
+        assert entry_input(at).value == pytest.approx(plan.limit_price)
+
+
+# ---------------------------------------------------------------------------
 # News & veto (Human-in-the-Loop) + capital shield
 # ---------------------------------------------------------------------------
 
@@ -680,7 +899,7 @@ class TestNewsAndVeto:
 
     def test_approve_shows_capital_shield(self, monkeypatch):
         self.setup_green(monkeypatch)
-        plan = tg.compute_risk_plan(tg.latest_snapshot(tg.compute_indicators(self.df)))
+        plan = expected_risk(self.df)
         at = run_check()
         at.button(key="approve").click()
         at.run()
@@ -715,8 +934,7 @@ class TestNewsAndVeto:
 
     def test_sidebar_values_drive_the_capital_shield(self, monkeypatch):
         at = self.approve_with(monkeypatch, capital=50_000, risk_pct=2.0)
-        snap = tg.latest_snapshot(tg.compute_indicators(self.df))
-        plan = tg.compute_risk_plan(snap, capital=50_000, risk_pct=0.02)
+        plan = expected_risk(self.df, capital=50_000, risk_pct=0.02)
         text = page_text(at)
         assert r"\$50,000.00" in text   # capital (escaped '$' in markdown)
         assert r"\$1,000.00" in text    # 2% risk budget
@@ -730,10 +948,9 @@ class TestNewsAndVeto:
 
     def test_changing_settings_after_approval_recalculates(self, monkeypatch):
         at = self.approve_with(monkeypatch, capital=10_000, risk_pct=1.0)
-        snap = tg.latest_snapshot(tg.compute_indicators(self.df))
         at.number_input(key="capital").set_value(100_000)
         at.run()
-        expected = tg.compute_risk_plan(snap, capital=100_000, risk_pct=0.01)
+        expected = expected_risk(self.df, capital=100_000, risk_pct=0.01)
         assert RISK_TITLE in page_text(at)
         assert f"{expected.shares:,}" in [str(m.value) for m in at.metric]
 

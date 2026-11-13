@@ -418,7 +418,7 @@ class TestLatestSnapshot:
 
 def snap(
     close=110.0, sma_50=100.0, rsi=40.0, volume=900.0, volume_sma_20=1000.0, atr=2.0,
-    prev_close=None,
+    prev_close=None, low_20=None, close_slide_ago=None,
 ):
     return tg.Snapshot(
         date=date(2026, 10, 8),
@@ -429,6 +429,8 @@ def snap(
         volume_sma_20=volume_sma_20,
         atr_14=atr,
         prev_close=prev_close,
+        low_20=low_20,
+        close_slide_ago=close_slide_ago,
     )
 
 
@@ -1041,6 +1043,223 @@ class TestBuildValuationBlock:
 
     def test_every_tier_has_a_verdict(self):
         assert set(tg.VALUATION_VERDICTS) == set(T)
+
+
+# ---------------------------------------------------------------------------
+# Entry planning (checklist, falling knife, limit-price reference)
+# ---------------------------------------------------------------------------
+
+def entry_snap(**kwargs):
+    """Calm, uptrending defaults: close 110, SMA 100, ATR 2, no sharp moves."""
+    defaults = dict(
+        close=110.0, sma_50=100.0, atr=2.0, volume=900.0, volume_sma_20=1000.0,
+        prev_close=110.5, low_20=106.0, close_slide_ago=111.0,
+    )
+    return snap(**{**defaults, **kwargs})
+
+
+def condition_states(plan):
+    return [c.ok for c in plan.conditions]
+
+
+class TestEntryIndicators:
+    def test_low_20_is_the_lowest_low_of_the_previous_20_sessions(self):
+        closes = np.linspace(100, 150, 120)
+        df = make_ohlcv(closes)
+        out = tg.compute_indicators(df)
+        assert out["Low_20"].iloc[-1] == pytest.approx(df["Low"].iloc[-21:-1].min())
+
+    def test_low_20_excludes_todays_bar(self):
+        closes = np.r_[[100.0] * 119, 50.0]  # crash on the last day
+        out = tg.compute_indicators(make_ohlcv(closes))
+        assert out["Low_20"].iloc[-1] == pytest.approx(99.0)  # 100 * 0.99
+
+    def test_snapshot_carries_support_and_slide_reference(self):
+        closes = np.linspace(100, 150, 120)
+        df = tg.compute_indicators(make_ohlcv(closes))
+        s = tg.latest_snapshot(df)
+        assert s.low_20 == pytest.approx(df["Low_20"].iloc[-1])
+        assert s.close_slide_ago == pytest.approx(closes[-1 - tg.KNIFE_SLIDE_DAYS])
+
+    def test_snapshot_without_low_20_column_still_works(self):
+        df = tg.compute_indicators(make_ohlcv(np.linspace(100, 150, 120)))
+        s = tg.latest_snapshot(df.drop(columns=["Low_20"]))
+        assert s.low_20 is None
+
+    def test_default_snapshot_has_no_entry_fields(self):
+        assert snap().low_20 is None and snap().close_slide_ago is None
+
+
+class TestRiskPlanAtCustomEntry:
+    def test_entry_overrides_the_last_close(self):
+        plan = tg.compute_risk_plan(snap(close=100.0, atr=2.0), entry=90.0)
+        assert plan.entry == pytest.approx(90.0)
+        assert plan.stop_loss == pytest.approx(86.0)     # 90 - 2*2
+        assert plan.take_profit == pytest.approx(98.0)   # 90 + 2*4
+        assert plan.shares == 25                         # 100 / 4
+
+    def test_entry_none_keeps_the_last_close(self):
+        assert tg.compute_risk_plan(snap(close=100.0), entry=None).entry == 100.0
+
+    def test_entry_changes_the_affordability_cap(self):
+        plan = tg.compute_risk_plan(
+            snap(close=100.0, atr=0.1), capital=1_000.0, entry=50.0
+        )
+        assert plan.shares == 20 and plan.capped_by_capital  # 1,000 / 50
+
+    @pytest.mark.parametrize("entry", [4.0, 3.0])
+    def test_entry_at_or_below_the_stop_distance_is_invalid(self, entry):
+        plan = tg.compute_risk_plan(snap(close=100.0, atr=2.0), entry=entry)
+        assert not plan.is_valid and plan.shares == 0
+
+
+class TestComputeEntryPlan:
+    def test_all_conditions_met(self):
+        plan = tg.compute_entry_plan(entry_snap(), False, T.FAIR)
+        assert condition_states(plan) == [True] * 5
+        assert not plan.falling_knife
+
+    def test_five_conditions_with_hebrew_labels(self):
+        labels = [c.label for c in tg.compute_entry_plan(entry_snap()).conditions]
+        assert len(labels) == 5
+        assert "ממוצע 50" in labels[0]
+        assert "פאניקה" in labels[1]
+        assert "5 ימי המסחר" in labels[2]
+        assert "14 הימים" in labels[3]
+        assert "PEG" in labels[4]
+
+    def test_trend_condition_follows_sma(self):
+        plan = tg.compute_entry_plan(entry_snap(close=95.0, low_20=90.0))
+        assert plan.conditions[0].ok is False
+
+    # Panic day needs BOTH a >= 1.5 x ATR drop AND >= 1.5 x average volume.
+    @pytest.mark.parametrize(
+        "prev_close, volume, panic",
+        [
+            (113.0, 1500.0, True),    # drop 3.0 = 1.5 x ATR, volume = 1.5 x avg
+            (120.0, 3000.0, True),
+            (112.99, 1500.0, False),  # drop just under the threshold
+            (113.0, 1499.0, False),   # volume just under the threshold
+            (120.0, 900.0, False),    # big drop on calm volume
+            (110.5, 3000.0, False),   # heavy volume, no drop
+            (105.0, 3000.0, False),   # heavy volume on an UP day
+        ],
+    )
+    def test_panic_day_boundaries(self, prev_close, volume, panic):
+        plan = tg.compute_entry_plan(entry_snap(prev_close=prev_close, volume=volume))
+        assert plan.conditions[1].ok is (not panic)
+        assert plan.falling_knife is panic
+
+    # Sharp slide: close fell >= 3 x ATR (6.0) over the last 5 sessions.
+    @pytest.mark.parametrize(
+        "ago, slide", [(116.0, True), (130.0, True), (115.99, False), (100.0, False)]
+    )
+    def test_sharp_slide_boundaries(self, ago, slide):
+        plan = tg.compute_entry_plan(entry_snap(close_slide_ago=ago))
+        assert plan.conditions[2].ok is (not slide)
+        assert plan.falling_knife is slide
+
+    def test_unknown_price_history_gives_unknown_conditions(self):
+        plan = tg.compute_entry_plan(entry_snap(prev_close=None, close_slide_ago=None))
+        assert plan.conditions[1].ok is None and plan.conditions[2].ok is None
+        assert not plan.falling_knife
+
+    @pytest.mark.parametrize(
+        "blocked, expected", [(False, True), (True, False), (None, None)]
+    )
+    def test_earnings_condition(self, blocked, expected):
+        assert tg.compute_entry_plan(entry_snap(), blocked).conditions[3].ok is expected
+
+    @pytest.mark.parametrize(
+        "tier, expected",
+        [(T.ATTRACTIVE, True), (T.FAIR, True), (T.EXPENSIVE, False),
+         (T.UNPROFITABLE, False), (T.UNKNOWN, None)],
+    )
+    def test_valuation_condition(self, tier, expected):
+        plan = tg.compute_entry_plan(entry_snap(), False, tier)
+        assert plan.conditions[4].ok is expected
+
+    def test_earnings_and_valuation_never_make_a_falling_knife(self):
+        plan = tg.compute_entry_plan(entry_snap(), True, T.UNPROFITABLE)
+        assert not plan.falling_knife
+
+    # --- limit price, normal state: max(nearest support, close - 1 x ATR) ---
+
+    def test_limit_is_the_support_when_it_is_within_one_atr(self):
+        plan = tg.compute_entry_plan(entry_snap(low_20=109.0))  # 110 - 2 = 108
+        assert plan.support == pytest.approx(109.0)
+        assert plan.limit_price == pytest.approx(109.0)
+
+    def test_limit_is_one_atr_below_when_support_is_far(self):
+        plan = tg.compute_entry_plan(entry_snap(low_20=106.0))
+        assert plan.support == pytest.approx(106.0)
+        assert plan.limit_price == pytest.approx(108.0)
+
+    def test_support_is_the_higher_level_below_the_close(self):
+        plan = tg.compute_entry_plan(entry_snap(sma_50=109.5, low_20=106.0))
+        assert plan.support == pytest.approx(109.5)
+        assert plan.limit_price == pytest.approx(109.5)
+
+    def test_levels_at_or_above_the_close_are_not_support(self):
+        plan = tg.compute_entry_plan(entry_snap(
+            close=95.0, sma_50=100.0, low_20=95.0, prev_close=95.5, close_slide_ago=96.0
+        ))
+        assert not plan.falling_knife
+        assert plan.support is None
+        assert plan.limit_price == pytest.approx(93.0)  # 95 - 1 x ATR
+
+    def test_missing_low_20_uses_the_sma(self):
+        plan = tg.compute_entry_plan(entry_snap(sma_50=109.0, low_20=None))
+        assert plan.support == pytest.approx(109.0)
+
+    # --- limit price, falling knife: close - 2 x ATR, support ignored ---
+
+    def test_falling_knife_limit_is_two_atr_below_the_close(self):
+        plan = tg.compute_entry_plan(
+            entry_snap(prev_close=120.0, volume=3000.0, low_20=109.5)
+        )
+        assert plan.falling_knife
+        assert plan.limit_price == pytest.approx(106.0)  # 110 - 2*2, not 109.5
+
+    def test_limit_is_rounded_to_cents(self):
+        plan = tg.compute_entry_plan(entry_snap(close=110.0, atr=1.23456, low_20=100.0))
+        assert plan.limit_price == 108.77
+
+    def test_zero_atr_never_flags_a_knife_and_limit_stays_positive(self):
+        plan = tg.compute_entry_plan(
+            entry_snap(atr=0.0, prev_close=200.0, volume=9000.0, close_slide_ago=300.0)
+        )
+        assert not plan.falling_knife
+        assert plan.conditions[1].ok is None
+        assert plan.limit_price > 0
+
+    def test_non_positive_limit_falls_back_to_the_close(self):
+        plan = tg.compute_entry_plan(
+            entry_snap(close=3.0, sma_50=10.0, atr=2.0, prev_close=9.0, volume=5000.0,
+                       low_20=5.0)
+        )
+        assert plan.falling_knife          # 3 - 2*2 would be negative
+        assert plan.limit_price == pytest.approx(3.0)
+
+    def test_plan_is_frozen(self):
+        plan = tg.compute_entry_plan(entry_snap())
+        with pytest.raises(AttributeError):
+            plan.limit_price = 1.0
+
+    def test_real_series_calm_pullback_is_not_a_knife(self):
+        closes = np.concatenate([np.linspace(100, 160, 105), np.linspace(160, 154, 15)])
+        s = tg.latest_snapshot(tg.compute_indicators(make_ohlcv(closes)))
+        plan = tg.compute_entry_plan(s)
+        assert not plan.falling_knife
+        assert s.sma_50 < plan.limit_price < s.close
+
+    def test_real_series_crash_day_is_a_knife(self):
+        closes = np.r_[np.linspace(100, 200, 119), 170.0]
+        volumes = np.r_[np.full(119, 1_000_000.0), 4_000_000.0]
+        s = tg.latest_snapshot(tg.compute_indicators(make_ohlcv(closes, volumes)))
+        plan = tg.compute_entry_plan(s)
+        assert plan.falling_knife
+        assert plan.limit_price == pytest.approx(round(s.close - 2 * s.atr_14, 2))
 
 
 # ---------------------------------------------------------------------------
