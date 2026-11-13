@@ -959,6 +959,17 @@ class TestFetchValuation:
             v.tier = T.FAIR
 
 
+class TestFormatEps:
+    @pytest.mark.parametrize(
+        "eps, expected",
+        [(4.129, "$4.13"), (6.5, "$6.50"), (0.0, "$0.00"), (1234.5, "$1234.50"),
+         (-1.2, "-$1.20"), (-0.05, "-$0.05"), (-12.345, "-$12.35"),
+         (-0.004, "$0.00"), (-0.0, "$0.00")],
+    )
+    def test_sign_goes_before_the_dollar(self, eps, expected):
+        assert tg.format_eps(eps) == expected
+
+
 class TestBuildValuationBlock:
     FULL = tg.Valuation(30.0, 20.0, 1.4, 4.0, 6.0, T.FAIR)
 
@@ -972,10 +983,17 @@ class TestBuildValuationBlock:
 
     def test_explanations_and_eps(self):
         text = tg.build_valuation_block(self.FULL)
-        assert "ב-12 החודשים האחרונים (EPS = 4.00)." in text
-        assert "הצפוי בשנה הבאה (EPS = 6.00)." in text
+        assert "ב-12 החודשים האחרונים (EPS = $4.00)." in text
+        assert "הצפוי בשנה הבאה (EPS = $6.00)." in text
         assert "קצב הצמיחה של החברה" in text
         assert "אינה משנה את הסיווג הטכני" in text
+
+    def test_negative_eps_puts_the_minus_before_the_dollar(self):
+        v = tg.Valuation(trailing_eps=-1.2, forward_eps=-0.35, tier=T.UNPROFITABLE)
+        text = tg.build_valuation_block(v)
+        assert "ב-12 החודשים האחרונים (EPS = -$1.20)." in text
+        assert "הצפוי בשנה הבאה (EPS = -$0.35)." in text
+        assert "$-" not in text
 
     def test_missing_values_show_not_available(self):
         text = tg.build_valuation_block(tg.Valuation())

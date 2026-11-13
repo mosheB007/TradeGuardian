@@ -58,6 +58,7 @@ from tg_mentor_mvp import (
     fetch_next_earnings_date,
     fetch_price_history,
     fetch_valuation,
+    format_eps,
     is_earnings_too_close,
     latest_snapshot,
     normalize_ticker,
@@ -350,14 +351,14 @@ def render_valuation(v: Valuation) -> None:
     c1.metric(
         "1. מכפיל רווח (P/E)",
         f"{v.trailing_pe:.1f}" if v.trailing_pe is not None else VALUATION_NOT_AVAILABLE,
-        f"רווח למניה: ${v.trailing_eps:.2f}" if v.trailing_eps is not None else None,
+        f"רווח למניה: {format_eps(v.trailing_eps)}" if v.trailing_eps is not None else None,
         delta_color="off",
         delta_arrow="off",
     )
     c2.metric(
         "2. מכפיל עתידי (Forward P/E)",
         f"{v.forward_pe:.1f}" if v.forward_pe is not None else VALUATION_NOT_AVAILABLE,
-        f"רווח צפוי: ${v.forward_eps:.2f}" if v.forward_eps is not None else None,
+        f"רווח צפוי: {format_eps(v.forward_eps)}" if v.forward_eps is not None else None,
         delta_color="off",
         delta_arrow="off",
     )

@@ -966,8 +966,18 @@ def _ratio_text(value: float | None) -> str:
     return NOT_AVAILABLE if value is None else f"{value:,.2f}"
 
 
+def format_eps(eps: float) -> str:
+    """Signed dollar amount with the minus before the '$': -1.2 -> '-$1.20'.
+
+    A loss that rounds to zero is shown as '$0.00', never '-$0.00'.
+    """
+    if round(eps, 2) < 0:
+        return f"-${abs(eps):.2f}"
+    return f"${abs(eps):.2f}"
+
+
 def _eps_suffix(eps: float | None) -> str:
-    return "" if eps is None else f" (EPS = {eps:,.2f})"
+    return "" if eps is None else f" (EPS = {format_eps(eps)})"
 
 
 def build_valuation_block(v: Valuation) -> str:

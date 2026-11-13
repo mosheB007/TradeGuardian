@@ -465,6 +465,20 @@ class TestValuation:
             assert proto.color == MetricProto.MetricColor.GRAY
             assert proto.direction == MetricProto.MetricDirection.NONE
 
+    def test_negative_eps_puts_the_minus_before_the_dollar(self, monkeypatch):
+        at = self.check(monkeypatch, {
+            "trailingPE": 30.0, "forwardPE": 20.0,
+            "trailingEps": -1.2, "forwardEps": -0.35,
+        })
+        assert self.metric(at, PE_LABEL).proto.delta == "רווח למניה: -$1.20"
+        assert self.metric(at, FORWARD_PE_LABEL).proto.delta == "רווח צפוי: -$0.35"
+        assert "$-" not in page_text(at)
+        # A loss must not turn the gray, arrowless delta into a red "down" one.
+        for label in (PE_LABEL, FORWARD_PE_LABEL):
+            proto = self.metric(at, label).proto
+            assert proto.color == MetricProto.MetricColor.GRAY
+            assert proto.direction == MetricProto.MetricDirection.NONE
+
     def test_missing_values_show_not_available_without_delta(self, monkeypatch):
         at = self.check(monkeypatch, info=None)
         for label in (PE_LABEL, FORWARD_PE_LABEL, PEG_LABEL):
