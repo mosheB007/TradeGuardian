@@ -14,9 +14,12 @@ Implements PRD sections 3.A (data), 3.B (indicators), 3.C (3-level filter),
 the chart-link requirement from section 4.
 
 Flow:
-    1. Fetch prices. If earnings are due today..+14 days -> RED, stop.
+    1. Fetch prices. If earnings are due today..+14 days -> red warning
+       block, then the flow continues for learning purposes only.
        (Earnings date unknown -> yellow warning, continue.)
-    2. Technical report + 3-level classification. RED -> stop.
+    2. Technical report + 3-level classification, followed by an
+       educational valuation block (Trailing P/E, Forward P/E, PEG) that
+       never affects the classification. RED -> stop.
     3. GREEN/YELLOW: show headlines, ask the user for a news veto.
        'כן' -> disqualified, stop.  'לא' -> capital shield block.
 
@@ -100,6 +103,10 @@ VETO_PROMPT = (
     "האם זיהית בחדשות אירוע חריג שדורש פסילה? "
     "(הקלד 'כן' כדי לפסול, או 'לא' כדי להמשיך לניהול הסיכונים): "
 )
+# Valuation context (educational, never affects the technical Level).
+PEG_ATTRACTIVE_BELOW = 1.0  # 0 < PEG < 1.0 -> cheap relative to growth
+PEG_FAIR_MAX = 2.0          # 1.0 <= PEG <= 2.0 -> fair; above -> premium
+
 EARNINGS_UNKNOWN_MESSAGE = (
     "לא אותר תאריך דוח כספי. באחריותך לבדוק זאת ידנית לפני כניסה לעסקה."
 )
@@ -515,6 +522,120 @@ def ask_news_veto() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Valuation context - educational only (P/E, Forward P/E, PEG)
+#
+# Independent of the technical Level: it never changes GREEN/YELLOW/RED and
+# never stops the flow. Yahoo's `.info` endpoint is unreliable and often
+# empty (ETFs, small caps), so the fetch is best-effort and never raises.
+# ---------------------------------------------------------------------------
+
+class ValuationTier(Enum):
+    ATTRACTIVE = "attractive"      # מחיר טוב / זול יחסית לצמיחה: 0 < PEG < 1.0
+    FAIR = "fair"                  # מחיר בינוני / הוגן: 1.0 <= PEG <= 2.0
+    EXPENSIVE = "expensive"        # מחיר מנופח / פרמיה: PEG > 2.0
+    UNPROFITABLE = "unprofitable"  # חברה מפסידה / ללא רווח נקי
+    UNKNOWN = "unknown"            # נתוני תמחור חסרים (תעודת סל, אין נתוני צמיחה)
+
+
+@dataclass(frozen=True)
+class Valuation:
+    """Valuation multiples for one ticker; every field may be missing."""
+
+    trailing_pe: float | None = None
+    forward_pe: float | None = None
+    peg_ratio: float | None = None
+    trailing_eps: float | None = None
+    forward_eps: float | None = None
+    tier: ValuationTier = ValuationTier.UNKNOWN
+
+
+def _clean_float(val: object) -> float | None:
+    """Coerce a number-like value to a finite float; None if not possible.
+
+    Rejects None, bool (a subclass of int), NaN and +/-inf. Numeric strings
+    are accepted because Yahoo occasionally sends e.g. "Infinity" or "12.5".
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        number = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def classify_valuation(
+    trailing_pe: float | None,
+    forward_pe: float | None,
+    peg_ratio: float | None,
+    trailing_eps: float | None,
+    forward_eps: float | None = None,
+) -> ValuationTier:
+    """Map the multiples to a tier. PEG decides; P/E alone is never enough.
+
+    Any sign of losses - past (trailing EPS) or expected (forward EPS or
+    forward P/E) - wins over the PEG, so a company expected to lose money
+    is never shown as attractive or fair.
+    """
+    if trailing_eps is not None and trailing_eps <= 0:
+        return ValuationTier.UNPROFITABLE
+    if (forward_eps is not None and forward_eps <= 0) or (
+        forward_pe is not None and forward_pe <= 0
+    ):
+        return ValuationTier.UNPROFITABLE
+    if peg_ratio is not None:
+        if peg_ratio <= 0:  # negative earnings or negative growth
+            return ValuationTier.UNPROFITABLE
+        if peg_ratio < PEG_ATTRACTIVE_BELOW:
+            return ValuationTier.ATTRACTIVE
+        if peg_ratio <= PEG_FAIR_MAX:
+            return ValuationTier.FAIR
+        return ValuationTier.EXPENSIVE
+    if trailing_pe is not None and trailing_pe <= 0:
+        return ValuationTier.UNPROFITABLE
+    # Without growth data we cannot tell whether a high P/E is justified.
+    return ValuationTier.UNKNOWN
+
+
+def fetch_valuation(ticker: str) -> Valuation:
+    """Best-effort valuation multiples from Yahoo. Never raises."""
+    try:
+        info = yf.Ticker(ticker).info
+        if not isinstance(info, dict):
+            return Valuation()
+        trailing_pe = _clean_float(info.get("trailingPE"))
+        forward_pe = _clean_float(info.get("forwardPE"))
+        trailing_eps = _clean_float(info.get("trailingEps"))
+        forward_eps = _clean_float(info.get("forwardEps"))
+        # Explicit None check, not `or`: a reported PEG of 0.0 is falsy but
+        # is real data (it classifies as UNPROFITABLE) and must be kept.
+        trailing_peg = _clean_float(info.get("trailingPegRatio"))
+        peg_ratio = (
+            trailing_peg
+            if trailing_peg is not None
+            else _clean_float(info.get("pegRatio"))
+        )
+        if (
+            peg_ratio is None
+            and forward_pe is not None and forward_pe > 0
+            and trailing_eps is not None and trailing_eps > 0
+            and forward_eps is not None and forward_eps > trailing_eps
+        ):
+            # Fallback: PEG from the EPS growth implied by analyst estimates.
+            growth_pct = ((forward_eps / trailing_eps) - 1.0) * 100.0
+            if growth_pct > 0:
+                peg_ratio = forward_pe / growth_pct
+        tier = classify_valuation(
+            trailing_pe, forward_pe, peg_ratio, trailing_eps, forward_eps
+        )
+        return Valuation(
+            trailing_pe, forward_pe, peg_ratio, trailing_eps, forward_eps, tier
+        )
+    except Exception:  # noqa: BLE001 - unstable endpoint must never crash the CLI
+        return Valuation()
+
+
+# ---------------------------------------------------------------------------
 # Capital shield - risk management for a simulated trade (PRD 3.E)
 # ---------------------------------------------------------------------------
 
@@ -794,7 +915,7 @@ def _days_until_text(days: int) -> str:
 
 
 def build_earnings_block(ticker: str, earnings: date, today: date) -> str:
-    """Render the red 'earnings too close' disqualification."""
+    """Render the red 'earnings too close' warning (the flow continues after it)."""
     when = _days_until_text((earnings - today).days)
     return "\n".join([
         SEPARATOR,
@@ -804,7 +925,7 @@ def build_earnings_block(ticker: str, earnings: date, today: date) -> str:
         f"  זה בתוך חלון של {EARNINGS_BLACKOUT_DAYS} הימים הקרובים - קרוב מדי ומסוכן לסחור.",
         "  סביב פרסום דוח כספי המחיר עלול לזנק או לצנוח בפער (Gap) חד בבת אחת,",
         "  וקו ההגנה (Stop-Loss) לא יוכל להגן עליך.",
-        "  הניתוח נעצר כאן. בדוק את המניה שוב לאחר פרסום הדוח.",
+        "  הניתוח ממשיך לצורכי לימוד בלבד. מומלץ להמתין לפרסום הדוח לפני כניסה לעסקה.",
     ])
 
 
@@ -814,6 +935,78 @@ def build_earnings_info_line(earnings: date, today: date) -> str:
         f"תאריך הדוח הכספי הבא: {earnings.isoformat()} ({when}) - "
         f"מחוץ לחלון הסיכון של {EARNINGS_BLACKOUT_DAYS} ימים."
     )
+
+
+VALUATION_TITLE = "בדיקת תמחור וערך (מכפילי רווח וצמיחה)"
+NOT_AVAILABLE = "לא זמין"
+VALUATION_VERDICTS = {
+    ValuationTier.ATTRACTIVE: (
+        "[ירוק] תמחור נוח (זול יחסית לצמיחה) - PEG מתחת ל-1.0: "
+        "קצב הצמיחה של החברה מצדיק ואף עוקף את מכפיל הרווח שלה."
+    ),
+    ValuationTier.FAIR: (
+        "[צהוב] תמחור בינוני (הוגן) - PEG בין 1.0 ל-2.0: "
+        "המניה נסחרת סביב השווי ההוגן שלה ביחס לקצב הצמיחה."
+    ),
+    ValuationTier.EXPENSIVE: (
+        "[אדום] תמחור מנופח (פרמיה) - PEG מעל 2.0: "
+        "אתם משלמים פרמיה גבוהה על החברה ביחס לקצב הצמיחה שלה."
+    ),
+    ValuationTier.UNPROFITABLE: (
+        "[אדום] חברה מפסידה או בצמיחה שלילית - אין מכפיל רווח חיובי תקין."
+    ),
+    ValuationTier.UNKNOWN: (
+        "[צהוב] נתוני תמחור חסרים - לא ניתן לקבוע האם המחיר מנופח "
+        "(נפוץ בתעודות סל או כשאין תחזיות אנליסטים)."
+    ),
+}
+
+
+def _ratio_text(value: float | None) -> str:
+    return NOT_AVAILABLE if value is None else f"{value:,.2f}"
+
+
+def format_eps(eps: float) -> str:
+    """Signed dollar amount with the minus before the '$': -1.2 -> '-$1.20'.
+
+    A loss that rounds to zero is shown as '$0.00', never '-$0.00'.
+    """
+    if round(eps, 2) < 0:
+        return f"-${abs(eps):.2f}"
+    return f"${abs(eps):.2f}"
+
+
+def _eps_suffix(eps: float | None) -> str:
+    return "" if eps is None else f" (EPS = {format_eps(eps)})"
+
+
+def build_valuation_block(v: Valuation) -> str:
+    """Render the educational valuation section (independent of the Level)."""
+    lines = [
+        VALUATION_TITLE,
+        THIN_SEPARATOR,
+        f"  1. מכפיל רווח נוכחי (Trailing P/E): {_ratio_text(v.trailing_pe)}",
+        "     מחיר המניה חלקי הרווח למניה ב-12 החודשים האחרונים"
+        f"{_eps_suffix(v.trailing_eps)}.",
+        f"  2. מכפיל רווח עתידי (Forward P/E): {_ratio_text(v.forward_pe)}",
+        "     מחיר המניה חלקי הרווח למניה הצפוי בשנה הבאה"
+        f"{_eps_suffix(v.forward_eps)}.",
+    ]
+    if (
+        v.trailing_pe is not None
+        and v.forward_pe is not None
+        and v.forward_pe < v.trailing_pe
+    ):
+        lines.append("     הרווח צפוי לצמוח ולכן המכפיל העתידי נמוך יותר.")
+    lines += [
+        f"  3. יחס צמיחה (PEG Ratio): {_ratio_text(v.peg_ratio)}",
+        "     מתאים את מכפיל הרווח לקצב הצמיחה של החברה (מכפיל רווח חלקי צמיחה באחוזים).",
+        "",
+        f"  {VALUATION_VERDICTS[v.tier]}",
+        "  הערה: בדיקת התמחור היא הקשר לימודי בלבד ואינה משנה את הסיווג הטכני.",
+        THIN_SEPARATOR,
+    ]
+    return "\n".join(lines)
 
 
 def build_news_block(ticker: str, items: list[NewsItem]) -> str:
@@ -880,14 +1073,14 @@ def main() -> int:
         history = fetch_price_history(ticker)
         history, session_open = drop_incomplete_session(history)
 
-        # PRD 3.D: an imminent earnings report disqualifies before any analysis.
+        # PRD 3.D: an imminent earnings report gets a red warning block, but
+        # the analysis continues behind it for learning purposes.
         today = date.today()
         earnings = fetch_next_earnings_date(ticker, today)
-        if earnings is not None and is_earnings_too_close(earnings, today):
+        earnings_blocked = earnings is not None and is_earnings_too_close(earnings, today)
+        if earnings_blocked:
             print()
             print(build_earnings_block(ticker, earnings, today))
-            print(build_footer())
-            return 0
 
         snapshot = latest_snapshot(compute_indicators(history))
         level = classify(snapshot)
@@ -899,10 +1092,13 @@ def main() -> int:
             )
         if earnings is None:
             print(f"[צהוב] {EARNINGS_UNKNOWN_MESSAGE}")
-        else:
+        elif not earnings_blocked:  # the red block above already covers it
             print(build_earnings_info_line(earnings, today))
         print()
         print(build_report(ticker, snapshot, level))
+        print()
+        # Educational context only: shown for every level, never changes it.
+        print(build_valuation_block(fetch_valuation(ticker)))
         print()
 
         if level is not Level.RED:
